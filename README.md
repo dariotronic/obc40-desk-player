@@ -21,7 +21,7 @@ The board has no audio output: the music plays on another Spotify device (PC, ph
 - **List or card view**. Albums, playlists and the queue always use the list.
 - **Accent colour** taken from the album cover, always readable on the dark background.
 - Built for touch: no tooltips, no dashed focus rings, works with the onboard on-screen keyboard.
-- Works with [obc40-home](https://github.com/dariotronic/obc40-home): its **Music** tile opens Desk Player, and Desk Player's 🏠 button goes back to it.
+- The 🏠 button minimises Desk Player and shows whatever is behind it.
 
 ## Requirements
 
@@ -38,12 +38,6 @@ On the board, open a terminal **as the desktop user** (not root) and run **one l
 wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/get.sh | sh -s -- --desktop-icon
 ```
 
-To install the touch launcher [obc40-home](https://github.com/dariotronic/obc40-home) too, in one go:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/get.sh | sh -s -- --with-home --desktop-icon
-```
-
 [`get.sh`](get.sh) does the following:
 1. checks the system packages and, if some are missing, offers to install them with `su` (it asks for the root password);
 2. downloads the latest release and verifies its SHA-256 checksum;
@@ -52,8 +46,7 @@ wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/g
 
 Options:
 - `--desktop-icon`: puts a "Musica" icon on the desktop;
-- `--autostart`: opens Desk Player at every login;
-- `--no-autostart`: for the launcher.
+- `--autostart`: opens Desk Player at every login.
 
 Running it again reinstalls the latest version.
 
@@ -69,7 +62,7 @@ sh obc40-desk-player/install.sh --desktop-icon     # add --autostart to open it 
 ```
 </details>
 
-Then open **Musica** from the menu, the desktop or the obc40-home tile.
+Then open **Musica** from the menu or the desktop.
 
 ## Connect your Spotify account (once)
 
@@ -127,7 +120,7 @@ The code is plain Python 3 + GTK 3 with no build step.
 | File | What |
 |---|---|
 | `desk-player` | the app |
-| `obc_update.py` | the updater, shared with obc40-home: keep the two copies identical |
+| `obc_update.py` | the in-app updater (GitHub Releases) |
 | `login-tunnel.py` | runs on the PC |
 | `dev/` | test helpers to run on the board |
 
@@ -178,7 +171,7 @@ Issues and pull requests are welcome. Only the maintainers can push to this repo
 wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/get.sh | sh -s -- --desktop-icon
 ```
 
-Per installare insieme anche il launcher obc40-home, aggiungi `--with-home`. Lo script controlla i pacchetti di sistema e, se ne manca qualcuno, si offre di installarli chiedendo la password di root. Poi scarica l'ultima versione, ne verifica il checksum, la installa e avvia l'app.
+Lo script controlla i pacchetti di sistema e, se ne manca qualcuno, si offre di installarli chiedendo la password di root. Poi scarica l'ultima versione, ne verifica il checksum, la installa e avvia l'app.
 
 **Login Spotify** (una volta sola):
 1. Crea un'app su <https://developer.spotify.com/dashboard>:
