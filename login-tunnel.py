@@ -15,10 +15,10 @@ import subprocess
 import threading
 
 ap = argparse.ArgumentParser(description="Tunnel per il login Spotify di Desk Player")
-ap.add_argument("host", nargs="?", default="192.168.68.116", help="IP della scheda")
+ap.add_argument("host", help="IP (o nome) della scheda")
 ap.add_argument("--user", default="obc", help="utente SSH sulla scheda (predefinito: obc)")
-ap.add_argument("--key", default=os.path.expanduser("~/.ssh/obc40_ed25519"),
-                help="chiave SSH privata (se non esiste si usa la configurazione SSH predefinita)")
+ap.add_argument("--key", default=None,
+                help="chiave SSH privata (senza: si usa la configurazione SSH predefinita)")
 ap.add_argument("--port", type=int, default=8888)
 args = ap.parse_args()
 
