@@ -2,6 +2,12 @@
 
 All notable changes to obc40-desk-player. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.0.2
+
+- The 🏠 button now simply minimises Desk Player, showing whatever is behind it.
+- One-line installer: `wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/get.sh | sh`.
+- Release checksums use LF line endings, so `sha256sum -c` works.
+
 ## 0.0.1
 
 First public release.
