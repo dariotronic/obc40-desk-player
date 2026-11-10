@@ -1,0 +1,2224 @@
+#!/usr/bin/env python3
+"""Desk Player: fullscreen Spotify remote for the OBC40 1024x600 display (GTK3, Spotify Web API).
+
+https://github.com/dariotronic/obc40-desk-player
+
+One-time login from a PC (the board's sshd does not allow `ssh -L`):
+    python login-tunnel.py <board-ip> [--user obc] [--key ~/.ssh/key]
+then open http://127.0.0.1:8888 in the PC browser.
+"""
+import base64
+import hashlib
+import html
+import json
+import os
+import secrets
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+
+APP_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, APP_DIR)
+import obc_update  # noqa: E402
+
+NAME = "obc40-desk-player"
+REPO = "dariotronic/obc40-desk-player"
+WRAPPER = os.path.expanduser("~/.local/bin/desk-player")
+CONF_DIR = os.path.expanduser("~/.config/desk-player")
+AUTH_FILE = os.path.join(CONF_DIR, "auth.json")
+STATE_FILE = os.path.join(CONF_DIR, "state.json")
+PORT = 8888
+REDIRECT_URI = f"http://127.0.0.1:{PORT}/callback"
+SCOPES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
+          "user-library-read user-library-modify playlist-read-private playlist-read-collaborative "
+          "user-follow-read user-read-recently-played")
+API = "https://api.spotify.com/v1/"
+
+
+# ======================================================================
+# Persistenza
+# ======================================================================
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_json(path, data):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# ======================================================================
+# Spotify: autenticazione (PKCE) e API
+# ======================================================================
+
+class NotLoggedIn(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, status, reason, message):
+        super().__init__(message)
+        self.status, self.reason = status, reason
+
+
+class Auth:
+    def __init__(self, on_login):
+        self.data = load_json(AUTH_FILE)
+        self.lock = threading.Lock()
+        self.pending = None  # (verifier, state)
+        self.on_login = on_login
+
+    @property
+    def logged_in(self):
+        return bool(self.data.get("refresh_token"))
+
+    @property
+    def client_id(self):
+        return self.data.get("client_id", "")
+
+    def authorize_url(self, client_id):
+        self.data["client_id"] = client_id
+        save_json(AUTH_FILE, self.data)
+        verifier = secrets.token_urlsafe(64)[:96]
+        state = secrets.token_urlsafe(16)
+        self.pending = (verifier, state)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        q = urllib.parse.urlencode({
+            "client_id": client_id, "response_type": "code", "redirect_uri": REDIRECT_URI,
+            "code_challenge_method": "S256", "code_challenge": challenge, "state": state, "scope": SCOPES,
+        })
+        return "https://accounts.spotify.com/authorize?" + q
+
+    def callback(self, code, state):
+        if not self.pending or state != self.pending[1]:
+            raise RuntimeError("Sessione di login non valida, riprova da capo")
+        self._token_request({
+            "grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI,
+            "client_id": self.client_id, "code_verifier": self.pending[0],
+        })
+        self.pending = None
+        GLib.idle_add(self.on_login, True)
+
+    def _token_request(self, form):
+        req = urllib.request.Request("https://accounts.spotify.com/api/token",
+                                     data=urllib.parse.urlencode(form).encode(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                j = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            raise RuntimeError(f"Token {e.code}: {body}") from None
+        self.data["access_token"] = j["access_token"]
+        self.data["expires_at"] = time.time() + j.get("expires_in", 3600) - 60
+        if j.get("refresh_token"):
+            self.data["refresh_token"] = j["refresh_token"]
+        save_json(AUTH_FILE, self.data)
+
+    def token(self, force=False):
+        with self.lock:
+            if not force and self.data.get("access_token") and time.time() < self.data.get("expires_at", 0):
+                return self.data["access_token"]
+            if not self.logged_in:
+                raise NotLoggedIn()
+            try:
+                self._token_request({"grant_type": "refresh_token",
+                                     "refresh_token": self.data["refresh_token"],
+                                     "client_id": self.client_id})
+            except RuntimeError as e:
+                if "invalid_grant" in str(e):
+                    self.logout()
+                    raise NotLoggedIn() from None
+                raise
+            return self.data["access_token"]
+
+    def logout(self):
+        for k in ("access_token", "refresh_token", "expires_at"):
+            self.data.pop(k, None)
+        save_json(AUTH_FILE, self.data)
+        GLib.idle_add(self.on_login, False)
+
+
+def img_urls(j):
+    imgs = (j or {}).get("images") or []
+    if not imgs:
+        return None, None
+    return imgs[0].get("url"), imgs[-1].get("url")
+
+
+def parse_track(j, fallback_image=None, album_name=None, album_uri=None):
+    if not j or not j.get("uri"):
+        return None
+    if j.get("type") == "episode":
+        big, small = img_urls(j)
+        artists = (j.get("show") or {}).get("name", "")
+        album = artists
+        ctx = (j.get("show") or {}).get("uri")
+    else:
+        big, small = img_urls(j.get("album"))
+        artists = ", ".join(a.get("name", "") for a in j.get("artists") or [])
+        album = (j.get("album") or {}).get("name", "")
+        ctx = (j.get("album") or {}).get("uri")
+    artist_list = [(a.get("id"), a.get("name", "")) for a in j.get("artists") or [] if a.get("id")]
+    return {"id": j.get("id"), "uri": j["uri"], "name": j.get("name") or "?", "artists": artists,
+            "album": album_name or album, "image": big or fallback_image, "small": small or fallback_image,
+            "duration": j.get("duration_ms") or 0, "album_uri": album_uri or ctx, "artist_list": artist_list,
+            "added": "", "date": (j.get("album") or {}).get("release_date") or ""}
+
+
+def parse_coll(j, kind):
+    if not j or not j.get("id"):
+        return None
+    big, small = img_urls(j)
+    if kind == "playlist":
+        sub = (j.get("owner") or {}).get("display_name") or ""
+    elif kind == "album":
+        sub = ", ".join(a.get("name", "") for a in j.get("artists") or [])
+    else:
+        sub = "Artista"
+    c = {"kind": kind, "id": j["id"], "uri": j.get("uri", ""), "name": j.get("name") or "?",
+         "subtitle": sub, "image": small or big}
+    if kind == "album":
+        c["date"] = j.get("release_date") or ""
+        c["type"] = release_type(j)
+    return c
+
+
+def release_type(j):
+    t = j.get("album_type") or ""
+    if t == "album":
+        return "Album"
+    if t == "compilation":
+        return "Raccolta"
+    # l'API chiama "single" anche gli EP: Spotify considera EP le uscite da 4 a 6 brani
+    return "EP" if (j.get("total_tracks") or 0) >= 4 else "Singolo"
+
+
+def fmt_long(ms):
+    m = int(ms // 60000)
+    return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
+
+
+def detail_info(prefix, date, tracks, created=False):
+    parts = [x for x in (prefix,) if x]
+    if date:
+        parts.append(("creata nel " if created else "") + date[:4])
+    n = len(tracks)
+    parts.append(f"{n} {'brano' if n == 1 else 'brani'}")
+    parts.append(fmt_long(sum(t["duration"] for t in tracks)))
+    return " · ".join(parts)
+
+
+def parse_device(j):
+    if not j:
+        return None
+    return {"id": j.get("id"), "name": j.get("name") or "?", "type": (j.get("type") or "").lower(),
+            "active": bool(j.get("is_active")), "volume": j.get("volume_percent"),
+            "supports_volume": j.get("supports_volume", True)}
+
+
+class Spotify:
+    def __init__(self, auth):
+        self.auth = auth
+
+    @staticmethod
+    def _open(req, retries):
+        """Esegue la richiesta; ritenta sugli errori di rete temporanei (es. DNS "Try again")."""
+        for i in range(retries):
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    return r.read().decode(errors="replace")
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if i == retries - 1:
+                    raise
+                time.sleep(0.6 * (i + 1))
+
+    def call(self, method, path, body=None):
+        for attempt in range(2):
+            token = self.auth.token(force=attempt > 0)
+            data = json.dumps(body).encode() if body is not None else (b"" if method != "GET" else None)
+            req = urllib.request.Request(path if path.startswith("http") else API + path, data=data, method=method,
+                                         headers={"Authorization": f"Bearer {token}",
+                                                  "Content-Type": "application/json"})
+            try:
+                text = self._open(req, retries=3 if method == "GET" else 1)
+                # alcuni comandi (es. pausa) rispondono con testo non JSON: va bene lo stesso
+                try:
+                    return json.loads(text) if text.strip() else None
+                except ValueError:
+                    return None
+            except urllib.error.HTTPError as e:
+                text = e.read().decode(errors="replace")
+                if e.code == 401 and attempt == 0:
+                    continue
+                try:
+                    err = json.loads(text).get("error") or {}
+                except ValueError:
+                    err = {}
+                reason = err.get("reason") if isinstance(err, dict) else None
+                if reason == "NO_ACTIVE_DEVICE":
+                    msg = "Nessun dispositivo attivo: scegline uno"
+                elif reason == "PREMIUM_REQUIRED":
+                    msg = "Serve Spotify Premium"
+                elif e.code == 429:
+                    msg = "Troppe richieste, attendo un attimo"
+                else:
+                    msg = (err.get("message") if isinstance(err, dict) else None) or f"Errore {e.code}"
+                raise ApiError(e.code, reason, msg) from None
+        raise ApiError(401, None, "Accesso non autorizzato")
+
+    def first_ok(self, *paths):
+        last = None
+        for p in paths:
+            try:
+                return self.call("GET", p)
+            except ApiError as e:
+                if e.status not in (400, 403, 404):
+                    raise
+                last = e
+        raise last
+
+    # --- player ---
+    def player(self):
+        j = self.call("GET", "me/player?additional_types=episode")
+        if not j:
+            return None
+        return {"playing": bool(j.get("is_playing")), "track": parse_track(j.get("item")),
+                "progress": j.get("progress_ms") or 0, "fetched": time.time(),
+                "shuffle": bool(j.get("shuffle_state")), "repeat": j.get("repeat_state") or "off",
+                "device": parse_device(j.get("device")), "context": (j.get("context") or {}).get("uri")}
+
+    def devices(self):
+        return [d for d in (parse_device(x) for x in (self.call("GET", "me/player/devices") or {}).get("devices", [])) if d]
+
+    def _dev(self, device_id):
+        return f"?device_id={urllib.parse.quote(device_id)}" if device_id else ""
+
+    def play(self, device_id=None, body=None):
+        self.call("PUT", "me/player/play" + self._dev(device_id), body)
+
+    def pause(self): self.call("PUT", "me/player/pause")
+    def next(self): self.call("POST", "me/player/next")
+    def previous(self): self.call("POST", "me/player/previous")
+    def seek(self, ms): self.call("PUT", f"me/player/seek?position_ms={int(ms)}")
+    def volume(self, pct): self.call("PUT", f"me/player/volume?volume_percent={int(pct)}")
+    def shuffle(self, on): self.call("PUT", f"me/player/shuffle?state={'true' if on else 'false'}")
+    def repeat(self, state): self.call("PUT", f"me/player/repeat?state={state}")
+    def transfer(self, device_id): self.call("PUT", "me/player", {"device_ids": [device_id], "play": True})
+    def enqueue(self, uri): self.call("POST", "me/player/queue?uri=" + urllib.parse.quote(uri))
+
+    def play_context(self, ctx, offset_uri, device_id):
+        body = {"context_uri": ctx}
+        if offset_uri:
+            body["offset"] = {"uri": offset_uri}
+        self.play(device_id, body)
+
+    def play_uris(self, uris, offset, device_id):
+        self.play(device_id, {"uris": uris, "offset": {"position": offset}})
+
+    def queue(self):
+        j = self.call("GET", "me/player/queue") or {}
+        return parse_track(j.get("currently_playing")), [t for t in map(parse_track, j.get("queue") or []) if t]
+
+    # --- libreria ---
+    def playlists(self):
+        items = self.all_items(self.call("GET", "me/playlists?limit=50"), max_pages=10)
+        return [c for c in (parse_coll(x, "playlist") for x in items) if c]
+
+    def albums(self):
+        out = []
+        for x in self.all_items(self.call("GET", "me/albums?limit=50"), max_pages=10):
+            c = parse_coll(x.get("album"), "album")
+            if c:
+                c["added"] = (lambda v: "" if not v or v.startswith("1970") else v)(x.get("added_at"))
+                out.append(c)
+        return out
+
+    def artists(self):
+        out, path, n = [], "me/following?type=artist&limit=50", 0
+        while path and n < 10:
+            j = (self.call("GET", path) or {}).get("artists") or {}
+            out += [c for c in (parse_coll(x, "artist") for x in j.get("items", [])) if c]
+            path, n = j.get("next"), n + 1
+        return out
+
+    def liked_page(self, offset, limit=50):
+        """Una pagina di "Brani che ti piacciono" (ordine Spotify: aggiunti più di recente prima)."""
+        j = self.call("GET", f"me/tracks?limit={limit}&offset={offset}") or {}
+        out = []
+        for x in j.get("items", []):
+            t = parse_track(x.get("track"))
+            if t:
+                t["added"] = (lambda v: "" if not v or v.startswith("1970") else v)(x.get("added_at"))
+                out.append(t)
+        return out, j.get("total") or 0
+
+    def recent_map(self):
+        """URI -> ultimo ascolto (brani, album, playlist, artisti) dagli ultimi 50 ascolti; cache 2 min."""
+        if time.time() - getattr(self, "_rm_time", 0) < 120:
+            return self._rm
+        m = {}
+        for x in (self.call("GET", "me/player/recently-played?limit=50") or {}).get("items", []):
+            ts, t = x.get("played_at") or "", x.get("track") or {}
+            keys = [t.get("uri"), (t.get("album") or {}).get("uri"), (x.get("context") or {}).get("uri")]
+            keys += [a.get("uri") for a in t.get("artists") or []]
+            for k in keys:
+                if k and ts > m.get(k, ""):
+                    m[k] = ts
+        self._rm, self._rm_time = m, time.time()
+        return m
+
+    def recent(self):
+        out, seen = [], set()
+        for x in (self.call("GET", "me/player/recently-played?limit=50") or {}).get("items", []):
+            t = parse_track(x.get("track"))
+            if t and t["uri"] not in seen:
+                seen.add(t["uri"]); out.append(t)
+        return out
+
+    def all_items(self, page, max_pages=30):
+        """Segue i link "next" della paginazione Spotify."""
+        items = list((page or {}).get("items", []))
+        nxt, n = (page or {}).get("next"), 0
+        while nxt and n < max_pages:
+            page = self.call("GET", nxt) or {}
+            items += page.get("items", [])
+            nxt, n = page.get("next"), n + 1
+        return items
+
+    def playlist_tracks(self, pid):
+        try:
+            j = self.first_ok(f"playlists/{pid}/items?limit=100", f"playlists/{pid}/tracks?limit=100") or {}
+        except ApiError as e:
+            if e.status == 403:
+                raise ApiError(403, None, "Spotify non permette di vedere i brani delle playlist di altri utenti. "
+                                          "Puoi comunque riprodurla con il pulsante ▶ in alto.") from None
+            raise
+        items = self.all_items(j)
+        tracks = []
+        for x in items:
+            t = parse_track(x.get("item") or x.get("track"))
+            if t:
+                t["added"] = (lambda v: "" if not v or v.startswith("1970") else v)(x.get("added_at"))
+                tracks.append(t)
+        # l'API non espone la data di creazione: si usa il primo brano aggiunto
+        dates = sorted(x["added_at"] for x in items if x.get("added_at") and not x["added_at"].startswith("1970"))
+        return {"tracks": tracks, "date": dates[0] if dates else ""}
+
+    def album_tracks(self, coll):
+        j = self.call("GET", f"albums/{coll['id']}") or {}
+        big, _ = img_urls(j)
+        items = self.all_items(j.get("tracks"))
+        tracks = [t for t in (parse_track(x, big or coll["image"], coll["name"], coll["uri"]) for x in items) if t]
+        artists = ", ".join(a.get("name", "") for a in j.get("artists") or [])
+        return {"tracks": tracks, "date": j.get("release_date") or "", "type": release_type(j), "artists": artists}
+
+    def me_id(self):
+        if not getattr(self, "_me", None):
+            self._me = (self.call("GET", "me") or {}).get("id")
+        return self._me
+
+    def artist(self, aid):
+        """Album, singoli ed EP dell'artista, dal più recente."""
+        j = self.first_ok(f"artists/{aid}/albums?include_groups=album,single&limit=50",
+                          f"artists/{aid}/albums?include_groups=album,single&limit=10",
+                          f"artists/{aid}/albums") or {}
+        out, seen = [], set()
+        for x in self.all_items(j, max_pages=10):
+            c = parse_coll(x, "album")
+            if not c:
+                continue
+            key = (c["name"].lower(), c["type"])
+            if key in seen:
+                continue
+            seen.add(key)
+            c["subtitle"] = " · ".join(v for v in (c["date"][:4], c["type"]) if v)
+            c["added"] = c["date"]
+            out.append(c)
+        out.sort(key=lambda c: c["date"], reverse=True)
+        try:
+            image = img_urls(self.call("GET", f"artists/{aid}"))[1]
+        except ApiError:
+            image = None
+        return {"releases": out, "image": image}
+
+    def search(self, q):
+        j = self.call("GET", "search?" + urllib.parse.urlencode({"q": q, "type": "track,album,artist,playlist", "limit": 10})) or {}
+        items = lambda k: [x for x in (j.get(k) or {}).get("items", []) if x]  # noqa: E731
+        return {"tracks": [t for t in map(parse_track, items("tracks")) if t],
+                "artists": [c for c in (parse_coll(x, "artist") for x in items("artists")) if c],
+                "albums": [c for c in (parse_coll(x, "album") for x in items("albums")) if c],
+                # l'API blocca (403) i brani delle playlist di altri utenti: si mostrano solo le proprie
+                "playlists": [c for c in (parse_coll(x, "playlist") for x in items("playlists")
+                                          if (x.get("owner") or {}).get("id") == self.me_id()) if c]}
+
+
+# ======================================================================
+# Server di login (127.0.0.1:8888)
+# ======================================================================
+
+def page(title, body):
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.5}}
+input{{font-size:16px;padding:6px}}button{{font-size:16px;padding:6px 14px}}code{{background:#eee;padding:2px 4px}}</style>
+</head><body><h2>{html.escape(title)}</h2>{body}</body></html>"""
+
+
+def make_handler(auth):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, status, body, location=None):
+            data = body.encode()
+            self.send_response(status)
+            if location:
+                self.send_header("Location", location)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+            if u.path == "/":
+                cid = html.escape(auth.client_id)
+                self.send(200, page("Desk Player – login Spotify", f"""
+<p>1. Su <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com/dashboard</a>
+l'app deve avere come Redirect URI:<br><code>{REDIRECT_URI}</code></p>
+<p>2. Incolla qui il suo <b>Client ID</b> (lo stesso dell'app Android va bene):</p>
+<form action="/login"><input name="client_id" value="{cid}" size="40" autofocus>
+<button type="submit">Accedi con Spotify</button></form>"""))
+            elif u.path == "/login":
+                cid = q.get("client_id", "").strip()
+                if not cid:
+                    self.send(400, page("Manca il Client ID", "<a href='/'>Indietro</a>"))
+                else:
+                    self.send(302, "", auth.authorize_url(cid))
+            elif u.path == "/callback":
+                if "error" in q:
+                    self.send(400, page("Spotify ha rifiutato il login", html.escape(q["error"])))
+                elif "code" not in q:
+                    self.send(400, page("Risposta non valida", ""))
+                else:
+                    try:
+                        auth.callback(q["code"], q.get("state"))
+                        self.send(200, page("Fatto!", "Il display è collegato al tuo account. Puoi chiudere questa pagina."))
+                    except Exception as e:
+                        self.send(500, page("Errore", html.escape(str(e))))
+            else:
+                self.send(404, page("Non trovato", ""))
+    return H
+
+
+# ======================================================================
+# Interfaccia
+# ======================================================================
+
+CSS = b"""
+@define-color accent #ffb547;
+window.dp { background-color: #101114; }
+.panel { background-color: #17191e; }
+.title { font-size: 19px; font-weight: bold; color: #ffffff; }
+.artist { font-size: 14px; color: #9aa0aa; }
+.small { font-size: 12px; color: #9aa0aa; }
+.big { font-size: 26px; font-weight: bold; color: @accent; }
+.text { font-size: 16px; color: #9aa0aa; }
+.hdr { font-size: 13px; font-weight: bold; color: @accent; padding: 10px 16px 4px 16px; }
+.dtitle { font-size: 18px; font-weight: bold; color: #ffffff; }
+button.flat { background: none; border: none; box-shadow: none; color: #9aa0aa; min-height: 40px; min-width: 40px; }
+button.flat:active { color: @accent; }
+button.on, button.on image { color: @accent; }
+button.playbtn { background-color: @accent; background-image: none; border: none; border-radius: 999px;
+                 color: #101114; min-width: 60px; min-height: 60px; box-shadow: none; }
+button.playbtn image { color: #101114; }
+button.nav { background: none; border: none; box-shadow: none; border-radius: 20px; color: #9aa0aa; padding: 6px 14px; }
+button.nav.sel { background-color: #23262d; color: @accent; }
+button.nav.sel image { color: @accent; }
+button.chip { background-color: #1b1d23; background-image: none; border: 1px solid #2c3038; border-radius: 16px;
+              color: #ffffff; padding: 4px 12px; box-shadow: none; }
+button.chip.sel { background-color: @accent; color: #101114; border-color: @accent; }
+list, list row { background-color: transparent; }
+list row { padding: 6px 12px; }
+list row:hover { background-color: #1b1d23; }
+list row:active { background-color: #23262d; }
+.rtitle { font-size: 15px; color: #ffffff; }
+.rtitle.cur { color: @accent; }
+.rsub { font-size: 12px; color: #9aa0aa; }
+.card { background-color: #1b1d23; border-radius: 12px; padding: 8px; }
+flowboxchild { padding: 0; }
+flowboxchild:active .card { background-color: #23262d; }
+button.cardbtn { background-color: rgba(16,17,20,0.85); background-image: none; border: none; border-radius: 999px;
+                 box-shadow: none; color: #ffffff; min-width: 34px; min-height: 34px; margin: 4px; padding: 0; }
+button.cardbtn:active { color: @accent; }
+.fullnp { background-color: #101114; }
+.ftitle { font-size: 30px; font-weight: bold; color: #ffffff; }
+.fartist { font-size: 20px; color: @accent; }
+.falbum { font-size: 16px; color: #9aa0aa; }
+.ftime { font-size: 14px; color: #9aa0aa; }
+button.playbtn-big { background-color: @accent; background-image: none; border: none; border-radius: 999px;
+                     color: #101114; min-width: 84px; min-height: 84px; box-shadow: none; }
+button.playbtn-big image { color: #101114; }
+.shade { background-color: rgba(0, 0, 0, 0.6); }
+.sortcard { background-color: #1b1d23; border-radius: 16px; padding: 18px; }
+button.sortopt { background-color: #23262d; background-image: none; border: none; border-radius: 12px;
+                 box-shadow: none; color: #ffffff; padding: 12px 16px; font-size: 17px; }
+button.sortopt.sel { background-color: @accent; color: #101114; }
+button.sortopt.sel image { color: #101114; }
+.toast { background-color: @accent; color: #101114; border-radius: 8px; padding: 10px 16px; font-size: 14px; margin: 16px; }
+scale trough { min-height: 4px; background-color: #23262d; }
+scale highlight { background-color: @accent; }
+scale slider { min-width: 18px; min-height: 18px; background-color: #ffffff; border: none; }
+"""
+
+IMG_POOL = ThreadPoolExecutor(max_workers=4)
+IMG_CACHE = {}
+IMG_GEN = [0]  # incrementato a ogni cambio pagina: scarta i download non più visibili
+
+
+def set_image(img, url, size, fallback="audio-x-generic-symbolic", keep=False):
+    """Carica un'immagine remota in un Gtk.Image (asincrono, con cache)."""
+    img.set_from_icon_name(fallback, Gtk.IconSize.DIALOG)
+    img.set_pixel_size(min(size, 64))
+    img.set_size_request(size, size)
+    if not url:
+        return
+    key = (url, size)
+    img._want = key
+    if key in IMG_CACHE:
+        img.set_from_pixbuf(IMG_CACHE[key])
+        return
+
+    gen = IMG_GEN[0]
+
+    def work():
+        if not keep and gen != IMG_GEN[0]:
+            return  # pagina cambiata nel frattempo
+        try:
+            pb = download_pixbuf(url)
+            if pb is None:
+                return
+            w, h = pb.get_width(), pb.get_height()
+            s = min(w, h)
+            pb = pb.new_subpixbuf((w - s) // 2, (h - s) // 2, s, s).scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+            if len(IMG_CACHE) > 400:
+                IMG_CACHE.clear()
+            IMG_CACHE[key] = pb
+            GLib.idle_add(lambda: getattr(img, "_want", None) == key and img.set_from_pixbuf(pb) and False)
+        except Exception:
+            pass
+    IMG_POOL.submit(work)
+
+
+def download_pixbuf(url):
+    """Scarica un'immagine (ritenta sugli errori di rete temporanei). None se non disponibile."""
+    req = urllib.request.Request(url, headers={"User-Agent": "desk-player/1.0"})
+    data = None
+    for i in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+            break
+        except urllib.error.HTTPError:
+            return None
+        except Exception:
+            time.sleep(0.6 * (i + 1))
+    if data is None:
+        return None
+    loader = GdkPixbuf.PixbufLoader()
+    loader.write(data); loader.close()
+    return loader.get_pixbuf()
+
+
+# ---------------- colore di accento dalla copertina ----------------
+
+ACCENT_DEFAULT = (0xff, 0xb5, 0x47)
+ACCENT_BG = (0x10, 0x11, 0x14)   # sfondo dell'app e colore del testo sui pulsanti accesi
+ACCENT_MIN_CONTRAST = 4.5        # rispetto ad ACCENT_BG (soglia WCAG AA): leggibile in entrambi i sensi
+
+
+def _luminance(rgb):
+    def ch(c):
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = rgb
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+
+
+def _contrast(a, b):
+    la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+ACCENT_SILVER = (0xd8, 0xda, 0xde)   # copertine neutre (bianco e nero puro)
+
+
+def _readable(h, l, s):
+    """Colore HLS schiarito quanto basta per il contrasto minimo con lo sfondo."""
+    import colorsys
+    out = None
+    while l <= 0.9:
+        out = tuple(round(c * 255) for c in colorsys.hls_to_rgb(h, l, s))
+        if _contrast(out, ACCENT_BG) >= ACCENT_MIN_CONTRAST:
+            break
+        l += 0.02
+    return out
+
+
+def cover_accent_info(pb):
+    """Colore di accento di una copertina e livello usato: "vivace", "tenue", "mista" o "argento".
+
+    1. vivace: riduce l'immagine a 24×24, raggruppa i pixel per tonalità pesandoli per
+       saturazione × luminosità (vince il colore deciso, non il fondo) e prende il gruppo più forte
+       con i due vicini.
+    2. tenue: se i colori decisi sono troppo pochi, cerca la tinta di fondo (seppia, fredda,
+       pastello) e ne fa un colore smorzato, tanto più deciso quanto più la copertina è tinta.
+       mista: come tenue, ma ci sono più tinte e nessuna prevale; se ne sceglie una a caso,
+       sempre la stessa per la stessa copertina.
+    3. argento: copertina davvero neutra (saturazione media sotto il 2%).
+    In tutti i casi il colore è reso leggibile sullo sfondo scuro.
+    """
+    import colorsys
+    import math
+    small = pb.scale_simple(24, 24, GdkPixbuf.InterpType.BILINEAR)
+    px, n, rs = small.get_pixels(), small.get_n_channels(), small.get_rowstride()
+    bins, sums = [0.0] * 36, [[0.0, 0.0, 0.0] for _ in range(36)]
+    tbins, tx, ty = [0.0] * 36, [0.0] * 36, [0.0] * 36   # tutte le tinte, anche deboli
+    sat_sum, lit = 0.0, 0
+    for y in range(24):
+        for x in range(24):
+            i = y * rs + x * n
+            r, g, b = px[i], px[i + 1], px[i + 2]
+            h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+            if v < 0.12:
+                continue  # quasi nero: tonalità inaffidabile
+            lit += 1
+            sat_sum += s
+            w = s * v
+            k = int(h * 36) % 36
+            tbins[k] += w
+            tx[k] += math.cos(h * 2 * math.pi) * w; ty[k] += math.sin(h * 2 * math.pi) * w
+            if s < 0.18 or v < 0.18:
+                continue
+            bins[k] += w
+            sums[k][0] += r * w; sums[k][1] += g * w; sums[k][2] += b * w
+
+    def strongest(bb):
+        best = max(range(36), key=lambda k: bb[k - 1] + bb[k] + bb[(k + 1) % 36])
+        return (best - 1, best, (best + 1) % 36)
+
+    group = strongest(bins)
+    weight = sum(bins[k] for k in group)
+    if weight >= 3.0:  # almeno una decina di pixel pieni di colore
+        rgb = [sum(sums[k][c] for k in group) / weight / 255 for c in range(3)]
+        h, l, s = colorsys.rgb_to_hls(*rgb)
+        return _readable(h, min(max(l, 0.45), 0.7), max(s, 0.6)), "vivace"
+    # tinta di fondo (seppia, fredda, pastello): la tinta prevalente deve essere almeno il 40%
+    # di tutta la "colorazione", altrimenti sono solo disturbi sparsi
+    mean_s = sat_sum / lit if lit else 0.0
+    if mean_s < 0.02:
+        return ACCENT_SILVER, "argento"
+    total = sum(tbins)
+    group = strongest(tbins)
+    tier = "tenue"
+    if sum(tbins[k] for k in group) / total < 0.4:
+        # più tinte, nessuna prevalente: se ne sceglie una a caso tra i picchi che pesano almeno
+        # il 15%, ma sempre la stessa per la stessa copertina (il caso dipende dai pixel)
+        import random
+        import zlib
+        peaks = []
+        for k in range(36):
+            g = (k - 1, k, (k + 1) % 36)
+            if tbins[k] > tbins[k - 1] and tbins[k] >= tbins[(k + 1) % 36] \
+                    and sum(tbins[j] for j in g) / total >= 0.15:
+                peaks.append(g)
+        group = random.Random(zlib.crc32(bytes(px))).choice(peaks or [group])
+        tier = "mista"
+    h = (math.atan2(sum(ty[k] for k in group), sum(tx[k] for k in group)) / (2 * math.pi)) % 1.0
+    # più la copertina è tinta, più il colore è deciso (da ~0,2 a ~0,41 di saturazione)
+    return _readable(h, 0.62, 0.15 + min(mean_s, 0.12) * 2.2), tier
+
+
+def cover_accent(pb):
+    return cover_accent_info(pb)[0]
+
+
+class Accent:
+    """Colore di accento dell'app: un foglio di stile di una riga che ridefinisce @accent."""
+    STEPS, STEP_MS = 8, 50   # dissolvenza di ~0,4 s (cambio secco se il ridisegno è lento)
+
+    def __init__(self):
+        self.prov = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self.prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self.cur, self.target, self._anim, self.fade = ACCENT_DEFAULT, ACCENT_DEFAULT, None, True
+        self.cache, self.want = {}, None
+        self._apply(ACCENT_DEFAULT)
+
+    def _apply(self, rgb):
+        r, g, b = (int(round(c)) for c in rgb)
+        self.prov.load_from_data(f"@define-color accent rgb({r},{g},{b});".encode())
+        self.cur = (r, g, b)
+
+    def set(self, rgb):
+        rgb = tuple(rgb or ACCENT_DEFAULT)
+        if rgb == self.target:
+            return
+        print("accento ->", "#%02x%02x%02x" % rgb, flush=True)
+        self.target = rgb
+        if self._anim:
+            GLib.source_remove(self._anim); self._anim = None
+        if not self.fade:
+            self._apply(rgb)
+            return
+        start, step, t0, last = self.cur, [0], time.time(), [time.time()]
+
+        def tick():
+            # se un passaggio ha richiesto troppo (pagina con molti elementi, ridisegno lento)
+            # si salta direttamente al colore finale: meglio un cambio secco che una sfumatura a scatti
+            now = time.time()
+            slow = now - last[0] > self.STEP_MS * 3 / 1000
+            last[0] = now
+            step[0] = self.STEPS if slow else step[0] + 1
+            t = step[0] / self.STEPS
+            self._apply(tuple(a + (b - a) * t for a, b in zip(start, rgb)))
+            if step[0] >= self.STEPS:
+                self._anim = None
+                print(f"dissolvenza accento: {(time.time() - t0) * 1000:.0f} ms", flush=True)
+                return False
+            return True
+        self._anim = GLib.timeout_add(self.STEP_MS, tick)
+
+    def from_cover(self, url):
+        """Imposta l'accento dalla copertina (in background, con cache per URL)."""
+        self.want = url
+        if not url:
+            self.set(None)
+            return
+        if url in self.cache:
+            self.set(self.cache[url])
+            return
+
+        def work():
+            try:
+                pb = download_pixbuf(url)
+                rgb = cover_accent(pb) if pb is not None else None
+            except Exception:
+                rgb = None
+            self.cache[url] = rgb
+            GLib.idle_add(lambda: self.want == url and self.set(rgb) and False)
+        IMG_POOL.submit(work)
+
+
+def icon_button(icon, cb, cls="flat", size=24, tip=None):
+    b = Gtk.Button()
+    img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+    img.set_pixel_size(size)
+    b.add(img)
+    b.get_style_context().add_class(cls)
+    b.set_relief(Gtk.ReliefStyle.NONE)
+    if tip:
+        # niente tooltip: col touch il puntatore resta fermo sul pulsante e il suggerimento resterebbe a video
+        b.get_accessible().set_name(tip)
+    b.connect("clicked", lambda *_: cb())
+    b._img = img
+    return b
+
+
+def label(text, cls, xalign=0.0, ellipsize=True, wrap=False):
+    lab = Gtk.Label(label=text, xalign=xalign)
+    lab.get_style_context().add_class(cls)
+    if ellipsize:
+        lab.set_ellipsize(Pango.EllipsizeMode.END)
+    if wrap:
+        lab.set_line_wrap(True)
+    return lab
+
+
+def fmt(ms):
+    s = int(ms // 1000)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+class ListView:
+    """Elenco a righe (Gtk.ListBox)."""
+
+    def __init__(self, container):
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.sw = sw
+        self.lb = Gtk.ListBox()
+        self.lb.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.lb.connect("row-activated", lambda _lb, row: getattr(row, "action", None) and row.action())
+        sw.add(self.lb)
+        container.pack_start(sw, True, True, 0)
+
+    def header(self, text):
+        row = Gtk.ListBoxRow(activatable=False, selectable=False)
+        row.add(label(text, "hdr"))
+        self.lb.add(row)
+
+    def empty(self, text):
+        row = Gtk.ListBoxRow(activatable=False)
+        row.add(label(text, "text", ellipsize=False, wrap=True))
+        self.lb.add(row)
+
+    def item(self, title, subtitle, image=None, round_img=False, action=None, buttons=(), extra=None,
+             number=None, current=False, icon=None):
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(spacing=12)
+        if number is not None:
+            n = label(str(number), "rsub", 1.0, ellipsize=False)
+            n.set_size_request(26, -1)
+            box.pack_start(n, False, False, 0)
+        elif icon:
+            im = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DND)
+            im.set_pixel_size(30)
+            box.pack_start(im, False, False, 4)
+        else:
+            im = Gtk.Image()
+            set_image(im, image, 44)
+            box.pack_start(im, False, False, 0)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        lt = label(title, "rtitle")
+        if current:
+            lt.get_style_context().add_class("cur")
+        col.pack_start(lt, False, False, 0)
+        if subtitle:
+            col.pack_start(label(subtitle, "rsub"), False, False, 0)
+        box.pack_start(col, True, True, 0)
+        trail = Gtk.Box(spacing=2)
+        if extra:
+            trail.pack_start(label(extra, "rsub", ellipsize=False), False, False, 4)
+        for ic, cb, tip in buttons:
+            trail.pack_start(icon_button(ic, cb, tip=tip), False, False, 0)
+        box.pack_end(trail, False, False, 0)
+        row.add(box)
+        row.action = action
+        self.lb.add(row)
+        return lt
+
+
+class CardView:
+    """Griglia di schede con copertina grande (Gtk.FlowBox), divisa per sezioni."""
+
+    SIZE = 136
+
+    def __init__(self, container):
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.sw = sw
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.box.set_margin_start(12)
+        self.box.set_margin_end(12)
+        self.box.set_margin_bottom(12)
+        sw.add(self.box)
+        container.pack_start(sw, True, True, 0)
+        self.flow = None
+
+    def _flow(self):
+        if self.flow is None:
+            f = Gtk.FlowBox()
+            f.set_selection_mode(Gtk.SelectionMode.NONE)
+            f.set_homogeneous(True)
+            f.set_min_children_per_line(2)
+            f.set_max_children_per_line(10)
+            f.set_column_spacing(10)
+            f.set_row_spacing(10)
+            f.set_valign(Gtk.Align.START)
+            f.connect("child-activated", lambda _f, ch: getattr(ch, "action", None) and ch.action())
+            self.box.pack_start(f, False, False, 4)
+            self.flow = f
+        return self.flow
+
+    def header(self, text):
+        self.flow = None
+        self.box.pack_start(label(text, "hdr"), False, False, 0)
+
+    def empty(self, text):
+        self.flow = None
+        self.box.pack_start(label(text, "text", ellipsize=False, wrap=True), False, False, 12)
+
+    def item(self, title, subtitle, image=None, round_img=False, action=None, buttons=(), extra=None,
+             number=None, current=False, icon=None):
+        ch = Gtk.FlowBoxChild()
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        card.get_style_context().add_class("card")
+        ov = Gtk.Overlay()
+        if icon:
+            im = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DIALOG)
+            im.set_pixel_size(72)
+            im.set_size_request(self.SIZE, self.SIZE)
+        else:
+            im = Gtk.Image()
+            set_image(im, image, self.SIZE)
+        ov.add(im)
+        if buttons:
+            bb = Gtk.Box(spacing=4, halign=Gtk.Align.END, valign=Gtk.Align.END)
+            for ic, cb, tip in buttons:
+                bb.pack_start(icon_button(ic, cb, cls="cardbtn", size=18, tip=tip), False, False, 0)
+            ov.add_overlay(bb)
+        card.pack_start(ov, False, False, 0)
+        lt = label(title, "rtitle")
+        lt.set_max_width_chars(1)
+        if current:
+            lt.get_style_context().add_class("cur")
+        card.pack_start(lt, False, False, 0)
+        sub = subtitle  # la durata nelle schede verrebbe troncata
+        if sub:
+            ls = label(sub, "rsub")
+            ls.set_max_width_chars(1)
+            card.pack_start(ls, False, False, 0)
+        card.set_size_request(self.SIZE, -1)
+        ch.add(card)
+        ch.action = action
+        self._flow().add(ch)
+        return lt
+
+
+class NowPlayingView:
+    """Pannello del brano in riproduzione: compatto (colonna sinistra) o a tutto schermo."""
+
+    def __init__(self, dp, full=False):
+        self.dp, self.full = dp, full
+        self.art_size = 520 if full else 264
+        mk = lambda cls_full, cls_small: cls_full if full else cls_small  # noqa: E731
+
+        # --- copertina ---
+        self.art = Gtk.Image()
+        self.art.set_halign(Gtk.Align.CENTER)
+        set_image(self.art, None, self.art_size)
+
+        # --- titolo, artista, mi piace ---
+        trow = Gtk.Box(spacing=6)
+        tcol = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2 if not full else 6)
+        self.l_title = label("Niente in riproduzione", mk("ftitle", "title"), ellipsize=not full, wrap=full)
+        self.l_artist = label("", mk("fartist", "artist"))
+        tcol.pack_start(self.l_title, False, False, 0)
+        art_ev = Gtk.EventBox()
+        art_ev.add(self.l_artist)
+        art_ev.connect("button-release-event", lambda *_: dp.open_current_artist())
+        tcol.pack_start(art_ev, False, False, 0)
+        if not full:
+            # le etichette non devono allargare la colonna: si troncano con "…"
+            for lab in (self.l_title, self.l_artist):
+                lab.set_max_width_chars(1)
+        if full:
+            self.l_title.set_lines(2)
+            self.l_title.set_ellipsize(Pango.EllipsizeMode.END)
+            self.l_album = label("", "falbum")
+            tcol.pack_start(self.l_album, False, False, 0)
+        trow.pack_start(tcol, True, True, 0)
+
+        # --- avanzamento ---
+        self.progress = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.001)
+        self.progress.set_draw_value(False)
+        self.progress.connect("change-value", dp.on_seek)
+        times = Gtk.Box()
+        self.l_pos = label("0:00", mk("ftime", "small"), ellipsize=False)
+        self.l_dur = label("0:00", mk("ftime", "small"), 1.0, ellipsize=False)
+        times.pack_start(self.l_pos, False, False, 0)
+        times.pack_end(self.l_dur, False, False, 0)
+
+        # --- comandi ---
+        big = 1.35 if full else 1.0
+        ctr = Gtk.Box()
+        self.b_shuffle = icon_button("media-playlist-shuffle-symbolic", dp.toggle_shuffle, size=int(24 * big), tip="Casuale")
+        b_prev = icon_button("media-skip-backward-symbolic", lambda: dp.act(dp.api.previous), size=int(30 * big))
+        self.b_play = icon_button("media-playback-start-symbolic", dp.toggle_play,
+                                  cls=mk("playbtn-big", "playbtn"), size=int(32 * big))
+        b_next = icon_button("media-skip-forward-symbolic", lambda: dp.act(dp.api.next), size=int(30 * big))
+        self.b_repeat = icon_button("media-playlist-repeat-symbolic", dp.cycle_repeat, size=int(24 * big), tip="Ripeti")
+        for b in (self.b_shuffle, b_prev, self.b_play, b_next, self.b_repeat):
+            b.set_valign(Gtk.Align.CENTER)
+            ctr.pack_start(b, True, False, 0)
+
+        # --- volume e dispositivo ---
+        vrow = Gtk.Box(spacing=8)
+        vi = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.BUTTON)
+        self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.volume.set_draw_value(False)
+        self.volume.connect("change-value", dp.on_volume)
+        vrow.pack_start(vi, False, False, 0)
+        vrow.pack_start(self.volume, True, True, 0)
+
+        drow = Gtk.Box(spacing=6)
+        dev = Gtk.EventBox()
+        self.l_device = label("", mk("ftime", "small"))
+        self.l_device.set_max_width_chars(1)
+        dev.add(self.l_device)
+        dev.connect("button-release-event", lambda *_: (dp.show_main(), dp.navigate_root(("devices",))))
+        drow.pack_start(dev, True, True, 0)
+        if full:
+            drow.pack_end(icon_button("view-restore-symbolic", dp.show_main, size=26, tip="Torna indietro"),
+                          False, False, 0)
+        else:
+            drow.pack_end(icon_button("view-fullscreen-symbolic", dp.show_full, size=22, tip="Tutto schermo"),
+                          False, False, 0)
+
+        spacer = lambda: Gtk.Box(vexpand=True)  # noqa: E731
+        if full:
+            self.root = Gtk.Box(spacing=40)
+            self.root.get_style_context().add_class("fullnp")
+            self.root.set_margin_start(40); self.root.set_margin_top(40); self.root.set_margin_bottom(40)
+            self.root.set_margin_end(30)
+            self.root.pack_start(self.art, False, False, 0)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            col.pack_start(trow, False, False, 0)
+            col.pack_start(spacer(), True, True, 0)
+            col.pack_start(self.progress, False, False, 0)
+            col.pack_start(times, False, False, 0)
+            col.pack_start(ctr, False, False, 14)
+            col.pack_start(vrow, False, False, 0)
+            col.pack_start(drow, False, False, 0)
+            self.root.pack_start(col, True, True, 0)
+        else:
+            self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.root.get_style_context().add_class("panel")
+            self.root.set_size_request(300, -1)
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            inner.set_margin_start(18); inner.set_margin_end(18)
+            inner.set_margin_top(18); inner.set_margin_bottom(8)
+            self.root.pack_start(inner, True, True, 0)
+            inner.pack_start(self.art, False, False, 0)
+            inner.pack_start(spacer(), True, True, 0)
+            inner.pack_start(trow, False, False, 0)
+            inner.pack_start(spacer(), True, True, 0)
+            inner.pack_start(self.progress, False, False, 0)
+            inner.pack_start(times, False, False, 0)
+            inner.pack_start(ctr, False, False, 4)
+            inner.pack_start(spacer(), True, True, 0)
+            inner.pack_start(vrow, False, False, 0)
+            inner.pack_start(drow, False, False, 0)
+
+    def set_position(self, pos, dur):
+        self.progress.set_value(pos / dur if dur else 0)
+        self.l_pos.set_text(fmt(pos))
+
+    def update(self, p, liked, track_changed, pending_vol):
+        t = p["track"] if p else None
+        self.l_title.set_text(t["name"] if t else "Niente in riproduzione")
+        self.l_artist.set_text(t["artists"] if t else ("Scegli un dispositivo" if not p else ""))
+        if self.full:
+            self.l_album.set_text(t["album"] if t else "")
+        self.l_dur.set_text(fmt(t["duration"]) if t else "0:00")
+        if track_changed:
+            set_image(self.art, t["image"] if t else None, self.art_size, keep=True)
+        DeskPlayer.set_icon(self.b_play, "media-playback-pause-symbolic" if p and p["playing"]
+                            else "media-playback-start-symbolic")
+        DeskPlayer.set_on(self.b_shuffle, bool(p and p["shuffle"]))
+        rep = p["repeat"] if p else "off"
+        DeskPlayer.set_icon(self.b_repeat, "media-playlist-repeat-song-symbolic" if rep == "track"
+                            else "media-playlist-repeat-symbolic")
+        DeskPlayer.set_on(self.b_repeat, rep != "off")
+        d = p["device"] if p else None
+        if d and d["volume"] is not None and pending_vol is None:
+            self.volume.set_value(d["volume"])
+        self.volume.set_sensitive(bool(d and d["supports_volume"] and d["volume"] is not None))
+        self.l_device.set_text(f"Su: {d['name']}" if d else "")
+        if not t:
+            self.set_position(0, 0)
+
+
+class TouchFocus:
+    """Col touch il focus resta sui pulsanti toccati (bordo tratteggiato): lo si toglie subito,
+    tranne che dai campi di testo. Quando la tastiera a schermo si chiude, si toglie anche da quelli."""
+
+    def __init__(self, win):
+        self.win = win
+        win.connect("set-focus", self.on_set_focus)
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            bus.signal_subscribe("org.onboard.Onboard", "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                 "/org/onboard/Onboard/Keyboard", None, Gio.DBusSignalFlags.NONE,
+                                 self.on_keyboard, None)
+        except GLib.Error:
+            pass
+
+    def on_set_focus(self, _win, widget):
+        if widget is not None and not isinstance(widget, Gtk.Entry):
+            GLib.idle_add(self.drop, False)
+
+    def drop(self, also_entries):
+        w = self.win.get_focus()
+        if w is not None and (also_entries or not isinstance(w, Gtk.Entry)):
+            self.win.set_focus(None)
+        return False
+
+    def on_keyboard(self, _conn, _sender, _path, _iface, _signal, params, _data):
+        changed = params.unpack()[1]
+        if changed.get("Visible") is False:
+            GLib.idle_add(self.drop, True)
+
+
+class DeskPlayer(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Desk Player")
+        self.get_style_context().add_class("dp")
+        self.set_default_size(1024, 600)
+        self.auth = Auth(self.on_login_changed)
+        self.api = Spotify(self.auth)
+        self.state = load_json(STATE_FILE)
+        self.accent = Accent()
+        self.skip_uris = []
+        self.header_image = None
+        self.liked_state = None
+        self.artist_filter = "all"
+        self.player = None
+        self.liked = False
+        self.hold_until = 0
+        self.pending_seek = None
+        self.pending_vol = None
+        self.stack = [("library",)]
+        self.lib_tab = "playlist"
+        self.search_text = ""
+        self.cache = {}
+        self.token = 0
+        self.track_labels = []
+        self.poll_count = 0
+
+        self.overlay = Gtk.Overlay()
+        self.add(self.overlay)
+        self.views = Gtk.Stack()
+        self.overlay.add(self.views)
+        self.toast = label("", "toast", 0.5, ellipsize=False)
+        self.toast.set_halign(Gtk.Align.CENTER); self.toast.set_valign(Gtk.Align.END)
+        self.toast.set_no_show_all(True)
+        self.overlay.add_overlay(self.toast)
+
+        self.views.add_named(self.build_login(), "login")
+        self.views.add_named(self.build_main(), "main")
+        self.np_full = NowPlayingView(self, full=True)
+        self.views.add_named(self.np_full.root, "full")
+        self.panels = [self.np_side, self.np_full]
+
+        self.start_server()
+        self.touch_focus = TouchFocus(self)
+        # partita bene: se era appena stata aggiornata, l'aggiornamento resta
+        GLib.timeout_add_seconds(20, obc_update.confirm_started, NAME)
+        GLib.timeout_add_seconds(2, lambda: obc_update.UpdateDialog(
+            self.overlay, NAME, REPO, APP_DIR, WRAPPER, quit_cb=self.get_application().quit,
+            accent="@accent").notify_rollback())
+        GLib.timeout_add(500, self.tick)
+        GLib.timeout_add(1000, self.poll_timer)
+
+    # ---------------- costruzione ----------------
+
+    def build_login(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER)
+        box.set_margin_start(50)
+        box.pack_start(label("Desk Player", "big"), False, False, 0)
+        box.pack_start(label("Per collegare il tuo account Spotify, dal PC:", "title"), False, False, 8)
+        for t in ("1. Apri un terminale ed esegui:",
+                  "   python login-tunnel.py " + self.local_ip(),
+                  "2. Lascialo aperto e apri nel browser del PC:  http://127.0.0.1:8888",
+                  "3. Incolla il Client ID della tua app Spotify e accedi"):
+            box.pack_start(label(t, "text", ellipsize=False), False, False, 0)
+        close = Gtk.Button(label="Torna alla Home")
+        close.get_style_context().add_class("chip")
+        close.set_halign(Gtk.Align.START)
+        close.connect("clicked", lambda *_: self.go_home())
+        box.pack_start(close, False, False, 20)
+        return box
+
+    def build_main(self):
+        row = Gtk.Box()
+        row.pack_start(self.build_now_playing(), False, False, 0)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        nav = Gtk.Box(spacing=4)
+        nav.set_margin_top(6); nav.set_margin_start(8); nav.set_margin_end(8)
+        self.nav_buttons = {}
+        for key, text, icon in (("library", "Libreria", "folder-music-symbolic"),
+                                ("search", "Cerca", "system-search-symbolic"),
+                                ("queue", "Coda", "view-list-symbolic"),
+                                ("devices", "Dispositivi", "audio-speakers-symbolic")):
+            b = Gtk.Button()
+            hb = Gtk.Box(spacing=6)
+            im = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON); im.set_pixel_size(18)
+            hb.pack_start(im, False, False, 0); hb.pack_start(Gtk.Label(label=text), False, False, 0)
+            b.add(hb)
+            b.get_style_context().add_class("nav")
+            b.connect("clicked", lambda _b, k=key: self.navigate_root((k,)))
+            nav.pack_start(b, False, False, 0)
+            self.nav_buttons[key] = b
+        nav.pack_end(icon_button("go-home-symbolic", self.go_home, tip="Home"), False, False, 0)
+        self.b_view = icon_button("view-grid-symbolic", self.toggle_view, tip="Elenco / schede")
+        nav.pack_end(self.b_view, False, False, 0)
+        self.update_view_icon()
+        right.pack_start(nav, False, False, 0)
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        right.pack_start(self.content, True, True, 0)
+        row.pack_start(right, True, True, 0)
+        return row
+
+    def build_now_playing(self):
+        self.np_side = NowPlayingView(self)
+        return self.np_side.root
+
+    def show_full(self):
+        self.views.set_visible_child_name("full")
+
+    def show_main(self):
+        if self.auth.logged_in:
+            self.views.set_visible_child_name("main")
+
+    # ---------------- login / server ----------------
+
+    def local_ip(self):
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.0.2.1", 9)); ip = s.getsockname()[0]; s.close()
+            return ip
+        except OSError:
+            return "<ip-scheda>"
+
+    def start_server(self):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", PORT), make_handler(self.auth))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+        except OSError as e:
+            print("server di login non avviato:", e)
+
+    def on_login_changed(self, logged):
+        self.views.set_visible_child_name("main" if logged else "login")
+        if logged:
+            self.cache.clear()
+            self.render()
+            self.refresh_player()
+        else:
+            self.player = None
+        return False
+
+    def go_home(self):
+        try:
+            Gio.Subprocess.new([os.path.expanduser("~/.local/bin/obc-home")], Gio.SubprocessFlags.NONE)
+        except GLib.Error:
+            pass
+        self.iconify()
+
+    # ---------------- utilità asincrone ----------------
+
+    def bg(self, fn, done=None, fail=None):
+        def work():
+            try:
+                res = fn()
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(lambda err=e: (fail or self.on_error)(err) and False)
+                return
+            if done:
+                GLib.idle_add(lambda r=res: done(r) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_error(self, e):
+        if isinstance(e, NotLoggedIn):
+            return False
+        self.show_toast(str(e) or "Errore di rete")
+        if isinstance(e, ApiError) and e.reason == "NO_ACTIVE_DEVICE":
+            self.navigate_root(("devices",))
+        return False
+
+    def show_toast(self, text):
+        self.toast.set_text(text); self.toast.show()
+        tid = object(); self._toast_id = tid
+        GLib.timeout_add(3500, lambda: (getattr(self, "_toast_id", None) is tid and self.toast.hide()) and False)
+
+    def act(self, fn, hold=1.2):
+        def run():
+            fn()
+            return True
+        def done(_):
+            self.hold_until = time.time() + hold
+            GLib.timeout_add(int(hold * 1000), lambda: (setattr(self, "hold_until", 0), self.refresh_player()) and False)
+            return False
+        def fail(e):
+            self.hold_until = 0
+            return self.on_error(e)
+        self.bg(run, done, fail)
+
+    def target_device(self):
+        return self.state.get("last_device") if not (self.player and self.player.get("device")) else None
+
+    # ---------------- player ----------------
+
+    def poll_timer(self):
+        self.poll_count += 1
+        playing = bool(self.player and self.player["playing"])
+        if self.auth.logged_in and (self.poll_count % (2 if playing else 4) == 0) and self.get_visible():
+            self.refresh_player()
+        return True
+
+    def refresh_player(self):
+        if not self.auth.logged_in:
+            return False
+
+        def fetch():
+            return self.api.player(), None
+
+        def done(res):
+            p, liked = res
+            if time.time() < self.hold_until:
+                return False
+            old_uri = self.player["track"]["uri"] if self.player and self.player["track"] else None
+            self.player = p
+            if liked is not None:
+                self.liked = liked
+            if p and p["device"] and p["device"]["id"] and p["device"]["id"] != self.state.get("last_device"):
+                self.state["last_device"] = p["device"]["id"]
+                save_json(STATE_FILE, self.state)
+            new_uri = p["track"]["uri"] if p and p["track"] else None
+            self.update_player_ui(track_changed=new_uri != old_uri)
+            # brano "rimosso" dalla coda: saltalo appena parte
+            if new_uri and new_uri != old_uri and new_uri in self.skip_uris:
+                self.skip_uris.remove(new_uri)
+                self.act(self.api.next, hold=0.8)
+            elif new_uri != old_uri and self.stack[-1][0] == "queue":
+                self.render()
+            return False
+        self.bg(fetch, done, lambda e: False)
+        return False
+
+    def position(self):
+        p = self.player
+        if not p:
+            return 0
+        pos = p["progress"] + ((time.time() - p["fetched"]) * 1000 if p["playing"] else 0)
+        dur = p["track"]["duration"] if p["track"] else 0
+        return max(0, min(pos, dur)) if dur else pos
+
+    def tick(self):
+        p = self.player
+        if p and p["track"] and self.pending_seek is None:
+            pos = self.position()
+            for np in self.panels:
+                np.set_position(pos, p["track"]["duration"])
+        return True
+
+    def update_player_ui(self, track_changed=False):
+        for np in self.panels:
+            np.update(self.player, self.liked, track_changed, self.pending_vol)
+        if track_changed:
+            self.highlight_current()
+            t = self.player["track"] if self.player else None
+            self.accent.from_cover((t.get("small") or t.get("image")) if t else None)
+
+    @staticmethod
+    def set_icon(btn, name):
+        btn._img.set_from_icon_name(name, Gtk.IconSize.BUTTON)
+
+    @staticmethod
+    def set_on(btn, on):
+        ctx = btn.get_style_context()
+        (ctx.add_class if on else ctx.remove_class)("on")
+
+    # azioni
+    def toggle_play(self):
+        p = self.player
+        playing = bool(p and p["playing"])
+        if p:
+            p["progress"] = self.position(); p["fetched"] = time.time(); p["playing"] = not playing
+            self.update_player_ui()
+        dev = self.target_device()
+        self.act(self.api.pause if playing else (lambda: self.api.play(dev)))
+
+    def toggle_shuffle(self):
+        on = not (self.player and self.player["shuffle"])
+        if self.player:
+            self.player["shuffle"] = on; self.update_player_ui()
+        self.act(lambda: self.api.shuffle(on))
+
+    def cycle_repeat(self):
+        nxt = {"off": "context", "context": "track"}.get(self.player["repeat"] if self.player else "off", "off")
+        if self.player:
+            self.player["repeat"] = nxt; self.update_player_ui()
+        self.act(lambda: self.api.repeat(nxt))
+
+    def on_seek(self, _scale, _scroll, value):
+        p = self.player
+        if not p or not p["track"]:
+            return True
+        dur = p["track"]["duration"]
+        self.pending_seek = max(0.0, min(1.0, value)) * dur
+        for np in self.panels:
+            np.l_pos.set_text(fmt(self.pending_seek))
+        tid = object(); self._seek_id = tid
+
+        def send():
+            if getattr(self, "_seek_id", None) is not tid or self.pending_seek is None:
+                return False
+            ms = self.pending_seek
+            self.pending_seek = None
+            if self.player:
+                self.player["progress"] = ms; self.player["fetched"] = time.time()
+            self.act(lambda: self.api.seek(ms))
+            return False
+        GLib.timeout_add(450, send)
+        return False
+
+    def on_volume(self, _scale, _scroll, value):
+        self.pending_vol = max(0, min(100, int(value)))
+        tid = object(); self._vol_id = tid
+
+        def send():
+            if getattr(self, "_vol_id", None) is not tid or self.pending_vol is None:
+                return False
+            v = self.pending_vol
+            self.pending_vol = None
+            if self.player and self.player["device"]:
+                self.player["device"]["volume"] = v
+            self.act(lambda: self.api.volume(v))
+            return False
+        GLib.timeout_add(350, send)
+        return False
+
+    def play_context(self, ctx, uri=None):
+        dev = self.target_device()
+        self.act(lambda: self.api.play_context(ctx, uri, dev))
+
+    def play_track(self, t, ctx=None, liked=False):
+        """Riproduce un brano dentro un contesto (album o Brani che ti piacciono).
+
+        Le richieste con una lista di URI vengono accettate da Spotify ma non partono
+        su alcuni client Connect, quindi si usa sempre un contesto con offset."""
+        dev = self.target_device()
+
+        def run():
+            c = ctx or (f"spotify:user:{self.api.me_id()}:collection" if liked else t.get("album_uri"))
+            if c:
+                self.api.play_context(c, t["uri"], dev)
+            else:
+                self.api.play(dev, {"uris": [t["uri"]]})
+        self.act(run)
+
+    def enqueue(self, t):
+        def done(_):
+            self.show_toast(f"Aggiunto alla coda: {t['name']}")
+            if self.stack[-1][0] == "queue":
+                GLib.timeout_add(700, lambda: self.stack[-1][0] == "queue" and self.render() and False)
+            return False
+        self.bg(lambda: self.api.enqueue(t["uri"]), done)
+
+    def unqueue(self, t):
+        """L'API Spotify non permette di togliere brani dalla coda: il brano viene
+        nascosto e saltato automaticamente quando arriva il suo turno."""
+        self.skip_uris.append(t["uri"])
+        self.show_toast(f"Rimosso dalla coda: {t['name']}")
+        if self.stack[-1][0] == "queue":
+            self.render()
+
+    def filter_queue(self, queue):
+        pending = list(self.skip_uris)
+        out = []
+        for t in queue:
+            if t["uri"] in pending:
+                pending.remove(t["uri"])
+            else:
+                out.append(t)
+        return out
+
+    def transfer(self, d):
+        if not d["id"]:
+            return
+        self.state["last_device"] = d["id"]; save_json(STATE_FILE, self.state)
+        self.act(lambda: self.api.transfer(d["id"]))
+
+    # ---------------- ordinamento ----------------
+
+    SORTS = (("added", "Aggiunto"), ("release", "Uscita"), ("recent", "Ascoltato"), ("alpha", "Nome"))
+    SORT_DEFAULT_DESC = {"added": True, "release": True, "recent": True, "alpha": False}
+    ALL_SORTS = ("added", "release", "recent", "alpha")
+    # Ordinamenti che hanno senso per ogni pagina (l'API non dà date per playlist e artisti seguiti).
+    # Il primo è quello usato se la scelta salvata non vale per la pagina.
+    PAGE_SORTS = {"playlist": ("added", "recent", "alpha"), "artist": ("alpha", "recent"),
+                  "releases": ("release", "recent", "alpha")}
+
+    @property
+    def sort_mode(self):
+        """Ordinamento effettivo della pagina corrente: la scelta salvata, se vale qui."""
+        avail = getattr(self, "page_sorts", self.ALL_SORTS)
+        m = self.state.get("sort", "release")
+        return m if m in avail else avail[0]
+
+    @property
+    def sort_desc(self):
+        if self.state.get("sort") == self.sort_mode and "sort_desc" in self.state:
+            return self.state["sort_desc"]
+        return self.SORT_DEFAULT_DESC[self.sort_mode]
+
+    @staticmethod
+    def arrow_icon(desc):
+        return "go-down-symbolic" if desc else "go-up-symbolic"
+
+    def sort_button(self):
+        b = Gtk.Button()
+        hb = Gtk.Box(spacing=6)
+        im = Gtk.Image.new_from_icon_name(self.arrow_icon(self.sort_desc), Gtk.IconSize.BUTTON)
+        im.set_pixel_size(16)
+        hb.pack_start(Gtk.Label(label=f"Ordina: {dict(self.SORTS)[self.sort_mode]}"), False, False, 0)
+        hb.pack_start(im, False, False, 0)
+        b.add(hb)
+        b.get_style_context().add_class("chip")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", lambda *_: self.sort_dialog())
+        return b
+
+    def sort_dialog(self):
+        """Finestra modale (dentro l'app) per scegliere ordinamento e direzione."""
+        if getattr(self, "_sort_modal", None):
+            return
+        shade = Gtk.EventBox()
+        shade.get_style_context().add_class("shade")
+        card_ev = Gtk.EventBox(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        card_ev.connect("button-release-event", lambda *_: True)  # i tocchi sulla scheda non la chiudono
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("sortcard")
+        card.set_size_request(380, -1)
+        card_ev.add(card)
+        shade.add(card_ev)
+
+        pending = {"mode": self.sort_mode, "desc": self.sort_desc}
+
+        def close(*_):  # tocco fuori: annulla
+            shade.destroy()
+            self._sort_modal = None
+            return True
+        shade.connect("button-release-event", close)
+
+        def apply(*_):
+            close()
+            if (pending["mode"], pending["desc"]) == (self.sort_mode, self.sort_desc):
+                return
+            self.state["sort"], self.state["sort_desc"] = pending["mode"], pending["desc"]
+            save_json(STATE_FILE, self.state)
+            if self.sort_mode == "recent":
+                self.bg(self.api.recent_map, lambda _r: self.render() and False)
+            else:
+                self.render()
+
+        card.pack_start(label("Ordina per", "dtitle"), False, False, 4)
+        rows = {}
+
+        def refresh():
+            for key, (btn, img) in rows.items():
+                on = key == pending["mode"]
+                (btn.get_style_context().add_class if on else btn.get_style_context().remove_class)("sel")
+                img.set_from_icon_name(self.arrow_icon(pending["desc"]), Gtk.IconSize.BUTTON)
+                img.set_pixel_size(22)
+                img.set_opacity(1.0 if on else 0.0)
+
+        def choose(key):
+            if key == pending["mode"]:
+                pending["desc"] = not pending["desc"]   # stessa voce: inverte la freccia
+            else:
+                pending["mode"], pending["desc"] = key, self.SORT_DEFAULT_DESC[key]
+            refresh()
+
+        avail = getattr(self, "page_sorts", self.ALL_SORTS)
+        for key, name in self.SORTS:
+            if key not in avail:
+                continue
+            if key == "recent":
+                name = "Ascoltato (ultimi 50 ascolti)"
+            btn = Gtk.Button()
+            btn.get_style_context().add_class("sortopt")
+            hb = Gtk.Box(spacing=10)
+            hb.pack_start(Gtk.Label(label=name, xalign=0), True, True, 0)
+            img = Gtk.Image()
+            hb.pack_end(img, False, False, 0)
+            btn.add(hb)
+            btn.connect("clicked", lambda _b, k=key: choose(k))
+            card.pack_start(btn, False, False, 0)
+            rows[key] = (btn, img)
+        card.pack_start(label("Tocca di nuovo la voce scelta per invertire la freccia", "rsub",
+                              ellipsize=False, wrap=True), False, False, 4)
+        done = Gtk.Button(label="Fatto")
+        done.get_style_context().add_class("chip")
+        done.get_style_context().add_class("sel")
+        done.connect("clicked", apply)
+        card.pack_start(done, False, False, 6)
+        self.overlay.add_overlay(shade)
+        shade.show_all()
+        refresh()
+        self._sort_modal = shade
+
+    def toolbar(self, *right):
+        """Riga con il pulsante di ordinamento a sinistra ed eventuali pulsanti a destra."""
+        bar = Gtk.Box(spacing=8)
+        bar.set_margin_start(14); bar.set_margin_end(8); bar.set_margin_bottom(4)
+        bar.pack_start(self.sort_button(), False, False, 0)
+        for w in right:
+            bar.pack_end(w, False, False, 0)
+        self.content.pack_start(bar, False, False, 0)
+
+    def sorted_items(self, items):
+        """Ordina secondo la scelta dell'utente; gli elementi senza dato finiscono sempre in fondo.
+
+        ↑ è sempre l'esatto rovescio di ↓, anche a parità di valore (es. brani di una playlist
+        aggiunti tutti insieme): a parità, ↓ tiene l'ordine di Spotify e ↑ lo inverte.
+        """
+        mode, desc = self.sort_mode, self.sort_desc
+        items = list(items)
+        if mode == "alpha":
+            val = lambda x: x["name"].casefold()  # noqa: E731
+        elif mode == "recent":
+            m = getattr(self.api, "_rm", {}) or {}
+            val = lambda x: m.get(x.get("uri"), "")  # noqa: E731
+        elif mode == "added":
+            if not any(x.get("added") for x in items):
+                # playlist della libreria: l'API non dà la data, ma le restituisce
+                # dalla più recente nella libreria
+                return items if desc else items[::-1]
+            val = lambda x: x.get("added") or ""  # noqa: E731
+        else:
+            val = lambda x: x.get("date") or ""  # noqa: E731
+        known = [x for x in items if val(x)]
+        rest = [x for x in items if not val(x)]
+        # sort stabile nella direzione "naturale" (A→Z per il nome, più recente prima per le date):
+        # a parità resta l'ordine di Spotify; la direzione opposta è il rovescio esatto
+        natural_desc = mode != "alpha"
+        out = sorted(known, key=val, reverse=natural_desc)
+        if desc != natural_desc:
+            out.reverse()
+        return out + rest
+
+    def with_recent(self, fn):
+        """Se l'ordinamento è per ascolto, carica anche la mappa degli ascolti recenti."""
+        if self.sort_mode != "recent":
+            return fn
+
+        def run():
+            data = fn()
+            try:
+                self.api.recent_map()
+            except Exception:
+                pass
+            return data
+        return run
+
+    def open_current_artist(self):
+        t = self.player and self.player["track"]
+        if not t or not t.get("artist_list"):
+            return
+        aid, name = t["artist_list"][0]
+        self.show_main()
+        top = self.stack[-1]
+        if top[0] == "detail" and top[1]["id"] == aid:
+            return
+        self.open(("detail", {"kind": "artist", "id": aid, "uri": f"spotify:artist:{aid}", "name": name,
+                              "subtitle": "Artista", "image": None}))
+
+    # ---------------- navigazione e pagine ----------------
+
+    @property
+    def cards(self):
+        return self.state.get("view") == "cards"
+
+    def toggle_view(self):
+        self.state["view"] = "list" if self.cards else "cards"
+        save_json(STATE_FILE, self.state)
+        self.update_view_icon()
+        self.render()
+
+    def update_view_icon(self):
+        # l'icona mostra la modalità in cui si passa toccandola
+        theme = Gtk.IconTheme.get_default()
+        names = (["view-list-symbolic", "view-list-bullet-symbolic"] if self.cards
+                 else ["view-grid-symbolic", "view-app-grid-symbolic"])
+        self.set_icon(self.b_view, next((n for n in names if theme.has_icon(n)), names[0]))
+
+    def navigate_root(self, pg):
+        self.stack = [pg]; self.render()
+
+    def open(self, pg):
+        if pg[0] == "detail" and pg[1]["kind"] == "artist":
+            self.artist_filter = "all"
+        self.stack.append(pg); self.render()
+
+    def back(self):
+        if len(self.stack) > 1:
+            self.stack.pop(); self.render()
+
+    def clear_content(self):
+        for c in self.content.get_children():
+            self.content.remove(c)
+            c.destroy()
+        self.track_labels = []
+
+    def render(self):
+        self.token += 1
+        IMG_GEN[0] += 1
+        self.clear_content()
+        root = self.stack[0][0]
+        for k, b in self.nav_buttons.items():
+            ctx = b.get_style_context()
+            (ctx.add_class if k == root else ctx.remove_class)("sel")
+        pg = self.stack[-1]
+        self.page_sorts = self.ALL_SORTS  # le pagine con meno dati lo restringono
+        getattr(self, "page_" + pg[0])(*pg[1:])
+        self.content.show_all()
+
+    def load(self, container, cache_key, fn, build):
+        """Mostra uno spinner, carica in background e costruisce il contenuto."""
+        token = self.token
+        if cache_key and cache_key in self.cache:
+            build(container, self.cache[cache_key]); container.show_all()
+            return
+        spin = Gtk.Spinner(); spin.start(); spin.set_size_request(48, 48)
+        box = Gtk.Box(valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER, vexpand=True)
+        box.pack_start(spin, False, False, 0)
+        container.pack_start(box, True, True, 0)
+
+        def done(data):
+            if token != self.token:
+                return False
+            if cache_key:
+                self.cache[cache_key] = data
+            container.remove(box)
+            build(container, data)
+            container.show_all()
+            return False
+
+        def fail(e):
+            if token != self.token:
+                return False
+            container.remove(box)
+            err = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, vexpand=True, spacing=8)
+            err.pack_start(label(str(e) or "Errore", "text", 0.5, ellipsize=False, wrap=True), False, False, 0)
+            again = Gtk.Button(label="Riprova"); again.get_style_context().add_class("chip")
+            again.set_halign(Gtk.Align.CENTER)
+            again.connect("clicked", lambda *_: self.render())
+            err.pack_start(again, False, False, 0)
+            container.pack_start(err, True, True, 0)
+            container.show_all()
+            return False
+        self.bg(fn, done, fail)
+
+    def scrolled_list(self, container, force_list=False):
+        return (CardView if self.cards and not force_list else ListView)(container)
+
+    def add_header(self, view, text):
+        view.header(text)
+
+    def add_row(self, view, title, subtitle, image=None, round_img=False, action=None, buttons=(),
+                extra=None, number=None, current=False, uri=None, icon=None):
+        lt = view.item(title, subtitle, image=image, round_img=round_img, action=action, buttons=buttons,
+                       extra=extra, number=number, current=current, icon=icon)
+        if uri:
+            self.track_labels.append((uri, lt))
+
+    def highlight_current(self):
+        cur = self.player["track"]["uri"] if self.player and self.player["track"] else None
+        for uri, lt in self.track_labels:
+            ctx = lt.get_style_context()
+            (ctx.add_class if uri == cur else ctx.remove_class)("cur")
+
+    def add_tracks(self, view, tracks, on_play, thumbs=True, removable=False):
+        cur = self.player["track"]["uri"] if self.player and self.player["track"] else None
+        for i, t in enumerate(tracks):
+            buttons = [("list-add-symbolic", lambda t=t: self.enqueue(t), "Aggiungi alla coda")]
+            if removable:
+                buttons.append(("list-remove-symbolic", lambda t=t: self.unqueue(t), "Rimuovi dalla coda"))
+            self.add_row(view, t["name"], t["artists"], image=t["small"] if thumbs or self.cards else None,
+                         number=None if thumbs else i + 1, current=t["uri"] == cur, uri=t["uri"],
+                         action=(lambda i=i: on_play(i)) if on_play else None, buttons=buttons,
+                         extra=fmt(t["duration"]))
+
+    def add_colls(self, view, colls):
+        cur = self.player.get("context") if self.player else None
+        for c in colls:
+            buttons = []
+            if c["kind"] != "artist":
+                buttons = [("media-playback-start-symbolic", lambda c=c: self.play_context(c["uri"]), "Riproduci")]
+            self.add_row(view, c["name"], c["subtitle"], image=c["image"], round_img=c["kind"] == "artist",
+                         action=lambda c=c: self.open(("detail", c)), buttons=buttons, current=c["uri"] == cur)
+
+    def empty(self, view, text):
+        view.empty(text)
+
+    def back_header(self, title, subtitle=None, image=None, play=None):
+        h = Gtk.Box(spacing=10)
+        h.set_margin_end(12)
+        h.pack_start(icon_button("go-previous-symbolic", self.back, tip="Indietro"), False, False, 0)
+        im = None
+        if image is not None:
+            im = Gtk.Image(); set_image(im, image or None, 48); h.pack_start(im, False, False, 0)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        col.pack_start(label(title, "dtitle"), False, False, 0)
+        sub = label(subtitle or "", "rsub")
+        col.pack_start(sub, False, False, 0)
+        h.pack_start(col, True, True, 0)
+        if play:
+            b = icon_button("media-playback-start-symbolic", play, cls="playbtn", size=26, tip="Riproduci")
+            b.set_valign(Gtk.Align.CENTER)
+            h.pack_end(b, False, False, 0)
+        self.content.pack_start(h, False, False, 4)
+        self.header_image = im
+        return sub
+
+    # pagine
+    def page_library(self):
+        chips = Gtk.Box(spacing=8)
+        chips.set_margin_start(14); chips.set_margin_top(6); chips.set_margin_bottom(4)
+        for key, text in (("playlist", "Playlist"), ("album", "Album"), ("artist", "Artisti")):
+            b = Gtk.Button(label=text); b.get_style_context().add_class("chip")
+            if key == self.lib_tab:
+                b.get_style_context().add_class("sel")
+            b.connect("clicked", lambda _b, k=key: (setattr(self, "lib_tab", k), self.render()))
+            chips.pack_start(b, False, False, 0)
+        for text, pg in (("Preferiti", ("liked",)), ("Recenti", ("recent",))):
+            b = Gtk.Button(label=text); b.get_style_context().add_class("chip")
+            b.connect("clicked", lambda _b, p=pg: self.open(p))
+            chips.pack_start(b, False, False, 0)
+        self.content.pack_start(chips, False, False, 0)
+        self.page_sorts = self.PAGE_SORTS.get(self.lib_tab, self.ALL_SORTS)
+        self.toolbar(icon_button("view-refresh-symbolic", self.reload_library, tip="Aggiorna"))
+        fn = {"playlist": self.api.playlists, "album": self.api.albums, "artist": self.api.artists}[self.lib_tab]
+
+        def build(container, colls):
+            lb = self.scrolled_list(container)
+            if not colls:
+                self.empty(lb, "Niente qui")
+            self.add_colls(lb, self.sorted_items(colls))
+        self.load(self.content, "lib:" + self.lib_tab, self.with_recent(fn), build)
+
+    def reload_library(self):
+        self.cache.pop("lib:" + self.lib_tab, None)
+        self.liked_state = None
+        self.render()
+
+    def page_search(self):
+        entry = Gtk.SearchEntry()
+        entry.set_placeholder_text("Brani, artisti, album, playlist")
+        entry.set_text(self.search_text)
+        entry.set_margin_start(14); entry.set_margin_end(14); entry.set_margin_top(6)
+        self.content.pack_start(entry, False, False, 0)
+        results = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.content.pack_start(results, True, True, 0)
+
+        def run_search(*_):
+            q = entry.get_text().strip()
+            self.search_text = q
+            for c in results.get_children():
+                results.remove(c); c.destroy()
+            self.track_labels = []
+            if not q:
+                return
+
+            def build(container, r):
+                lb = self.scrolled_list(container)
+                if r["tracks"]:
+                    self.add_header(lb, "Brani")
+                    self.add_tracks(lb, r["tracks"], lambda i: self.play_track(r["tracks"][i]))
+                for key, title in (("artists", "Artisti"), ("albums", "Album"), ("playlists", "Playlist")):
+                    if r[key]:
+                        self.add_header(lb, title); self.add_colls(lb, r[key])
+                if not any(r.values()):
+                    self.empty(lb, "Nessun risultato")
+            self.token += 1
+            self.load(results, "search:" + q, lambda: self.api.search(q), build)
+        entry.connect("search-changed", run_search)  # GTK aspetta già ~150 ms dopo la digitazione
+        # niente focus automatico: la tastiera si apre solo toccando il campo di testo
+        if self.search_text:
+            GLib.idle_add(lambda: run_search() and False)
+
+    def page_queue(self):
+        def build(container, data):
+            cur, queue = data
+            lb = self.scrolled_list(container, force_list=True)
+            self.add_header(lb, "In riproduzione")
+            if cur:
+                self.add_tracks(lb, [cur], None)
+            else:
+                self.empty(lb, "Niente")
+            self.add_header(lb, "Prossimi")
+            queue = self.filter_queue(queue)
+            if not queue:
+                self.empty(lb, "La coda è vuota")
+            self.add_tracks(lb, queue, None, removable=True)
+        h = Gtk.Box(); h.set_margin_start(14)
+        h.pack_end(icon_button("view-refresh-symbolic", self.render, tip="Aggiorna"), False, False, 8)
+        self.content.pack_start(h, False, False, 0)
+        self.load(self.content, None, self.api.queue, build)
+
+    def check_updates(self):
+        obc_update.UpdateDialog(self.overlay, NAME, REPO, APP_DIR, WRAPPER,
+                                quit_cb=self.get_application().quit, accent="@accent").start()
+
+    def page_devices(self):
+        h = Gtk.Box(spacing=8); h.set_margin_start(14); h.set_margin_top(4)
+        h.pack_start(label("Dove ascoltare", "hdr"), False, False, 0)
+        out = Gtk.Button(label="Esci dall'account"); out.get_style_context().add_class("chip")
+        out.connect("clicked", lambda *_: self.auth.logout())
+        h.pack_end(out, False, False, 8)
+        h.pack_end(icon_button("view-refresh-symbolic", self.render, tip="Aggiorna"), False, False, 0)
+        self.content.pack_start(h, False, False, 0)
+        foot = Gtk.Box(spacing=10)
+        foot.set_margin_start(16); foot.set_margin_end(12); foot.set_margin_bottom(8)
+        foot.pack_start(label(f"Desk Player {obc_update.read_version(APP_DIR)}", "rsub", ellipsize=False), False, False, 0)
+        upd = Gtk.Button()
+        ub = Gtk.Box(spacing=6)
+        ui = Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        ui.set_pixel_size(16)
+        ub.pack_start(Gtk.Label(label="Controlla aggiornamenti"), False, False, 0)
+        ub.pack_start(ui, False, False, 0)
+        upd.add(ub)
+        upd.get_style_context().add_class("chip")
+        upd.connect("clicked", lambda *_: self.check_updates())
+        foot.pack_end(upd, False, False, 0)
+        self.content.pack_end(foot, False, False, 0)
+        icons = {"computer": "computer-symbolic", "smartphone": "phone-symbolic", "tablet": "phone-symbolic",
+                 "tv": "video-display-symbolic", "castvideo": "video-display-symbolic"}
+
+        def build(container, devs):
+            lb = self.scrolled_list(container)
+            if not devs:
+                self.empty(lb, "Nessun dispositivo: apri Spotify sul PC o sul telefono, poi Aggiorna")
+            for d in devs:
+                self.add_row(lb, d["name"], "In uso" if d["active"] else d["type"],
+                             icon=icons.get(d["type"], "audio-speakers-symbolic"), current=d["active"],
+                             action=lambda d=d: self.transfer(d))
+        self.load(self.content, None, self.api.devices, build)
+
+    def track_page(self, title, key, fn, liked=False, sortable=False):
+        self.back_header(title)
+        if sortable:
+            self.toolbar()
+
+        def build(container, tracks):
+            if sortable:
+                tracks = self.sorted_items(tracks)
+            lb = self.scrolled_list(container)
+            if not tracks:
+                self.empty(lb, "Niente qui")
+            self.add_tracks(lb, tracks, lambda i: self.play_track(tracks[i], liked=liked))
+        self.load(self.content, key, self.with_recent(fn) if sortable else fn, build)
+
+    def page_liked(self):
+        self.back_header("Brani che ti piacciono")
+        self.toolbar()
+        if self.liked_state is None:
+            self.liked_state = {"items": [], "total": None, "loading": False}
+        st = self.liked_state
+        holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
+        self.content.pack_start(holder, True, True, 0)
+        token = self.token
+
+        def build_list(scroll_to=None):
+            for ch in holder.get_children():
+                holder.remove(ch); ch.destroy()
+            self.track_labels = []
+            tracks = self.sorted_items(st["items"])
+            view = self.scrolled_list(holder)
+            if not tracks:
+                self.empty(view, "Niente qui")
+            self.add_tracks(view, tracks, lambda i: self.play_track(tracks[i], liked=True))
+            more = st["total"] is not None and len(st["items"]) < st["total"]
+            if more:
+                view.empty(f"{len(st['items'])} di {st['total']} · scorri per caricarne altri")
+            view.sw.connect("edge-reached", lambda _sw, pos: pos == Gtk.PositionType.BOTTOM and load_more(view))
+            self._liked_more = lambda: load_more(view)  # per i test (dpnav.sh liked-more)
+            holder.show_all()
+            if scroll_to is not None:
+                adj = view.sw.get_vadjustment()
+                GLib.timeout_add(60, lambda: adj.set_value(scroll_to) and False)
+
+        def load_more(view):
+            if st["loading"] or st["total"] is None or len(st["items"]) >= st["total"]:
+                return
+            st["loading"] = True
+            pos = view.sw.get_vadjustment().get_value()
+
+            def done(res):
+                st["loading"] = False
+                st["items"] += res[0]; st["total"] = res[1]
+                print(f"preferiti caricati: {len(st['items'])} di {st['total']}", flush=True)
+                if token == self.token:
+                    build_list(scroll_to=pos)
+                return False
+
+            def fail(e):
+                st["loading"] = False
+                return self.on_error(e)
+            self.bg(lambda: self.api.liked_page(len(st["items"]), 50), done, fail)
+
+        if st["items"]:
+            build_list()
+            return
+
+        def first():
+            a, total = self.api.liked_page(0, 50)
+            b, total = self.api.liked_page(50, 50) if total > 50 else ([], total)
+            if self.sort_mode == "recent":
+                try:
+                    self.api.recent_map()
+                except Exception:
+                    pass
+            return a + b, total
+
+        def built(_container, res):
+            st["items"], st["total"] = res
+            build_list()
+        self.load(holder, None, first, built)
+
+    def page_recent(self):
+        self.track_page("Ascoltati di recente", "recent", self.api.recent)
+
+    def page_detail(self, c):
+        sub = self.back_header(c["name"], c["subtitle"], c["image"] or "", play=lambda: self.play_context(c["uri"]))
+        if c["kind"] == "artist":
+            self.artist_page(c)
+            return
+        if c["kind"] == "playlist":
+            self.toolbar()
+        if c["kind"] == "playlist":
+            fn = lambda: self.api.playlist_tracks(c["id"])  # noqa: E731
+        else:
+            fn = lambda: self.api.album_tracks(c)  # noqa: E731
+
+        def build(container, data):
+            tracks = data["tracks"]
+            if c["kind"] == "playlist":
+                sub.set_text(detail_info(c["subtitle"], data["date"], tracks, created=True))
+            else:
+                sub.set_text(detail_info(" · ".join(x for x in (data.get("artists"), data.get("type")) if x),
+                                         data["date"], tracks))
+            if c["kind"] == "playlist":
+                tracks = self.sorted_items(tracks)
+            lb = self.scrolled_list(container, force_list=True)
+            if not tracks:
+                self.empty(lb, "Nessun brano")
+            self.add_tracks(lb, tracks, lambda i: self.play_context(c["uri"], tracks[i]["uri"]),
+                            thumbs=c["kind"] == "playlist")
+        self.load(self.content, "detail:" + c["id"], self.with_recent(fn) if c["kind"] == "playlist" else fn, build)
+
+    def artist_page(self, c):
+        chips = Gtk.Box(spacing=8)
+        chips.set_margin_start(14); chips.set_margin_bottom(4)
+        for key, text in (("all", "Tutto"), ("album", "Album"), ("single", "Singoli"), ("ep", "EP")):
+            b = Gtk.Button(label=text); b.get_style_context().add_class("chip")
+            if key == self.artist_filter:
+                b.get_style_context().add_class("sel")
+            b.connect("clicked", lambda _b, k=key: (setattr(self, "artist_filter", k), self.render()))
+            chips.pack_start(b, False, False, 0)
+        self.page_sorts = self.PAGE_SORTS["releases"]
+        chips.pack_end(self.sort_button(), False, False, 8)
+        self.content.pack_start(chips, False, False, 0)
+        header_image = self.header_image
+
+        def build(container, data):
+            if data.get("image") and header_image is not None and not c["image"]:
+                set_image(header_image, data["image"], 48)
+            types = {"all": None, "album": ("Album", "Raccolta"), "single": ("Singolo",), "ep": ("EP",)}[self.artist_filter]
+            shown = [r for r in data["releases"] if types is None or r["type"] in types]
+            lb = self.scrolled_list(container)
+            if not shown:
+                self.empty(lb, "Niente qui")
+            self.add_colls(lb, self.sorted_items(shown))
+        self.load(self.content, "artist:" + c["id"], self.with_recent(lambda: self.api.artist(c["id"])), build)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="it.dario.deskplayer", flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # azione D-Bus per aprire una sezione: library, search, queue, devices, liked, recent
+        upd = Gio.SimpleAction.new("check-updates", None)   # per i test, via D-Bus
+        upd.connect("activate", lambda *_: self.win and self.win.check_updates())
+        self.add_action(upd)
+        nav = Gio.SimpleAction.new("navigate", GLib.VariantType.new("s"))
+        nav.connect("activate", lambda _a, v: self.win and self.win.auth.logged_in and self.on_navigate(v.get_string()))
+        self.add_action(nav)
+
+    def on_navigate(self, name):
+        if name == "full":
+            self.win.show_full()
+        elif name == "focus-info":
+            w = self.win.get_focus()
+            print("focus:", type(w).__name__ if w else None, flush=True)
+        elif name == "focus-button":
+            self.win.nav_buttons["library"].grab_focus()
+        elif name == "focus-search":
+            entries = [w for w in self.win.content.get_children()[0:1] if isinstance(w, Gtk.Entry)]
+            if entries:
+                entries[0].grab_focus()
+        elif name == "liked-more":
+            getattr(self.win, "_liked_more", lambda: None)()
+        elif name == "sort-dialog":
+            self.win.sort_dialog()
+        elif name == "current-artist":
+            self.win.open_current_artist()
+        elif name.startswith("accent:"):
+            # accent:<url copertina> | accent:default | accent:fade-on | accent:fade-off  (per i test)
+            arg = name.split(":", 1)[1]
+            acc = self.win.accent
+            if arg in ("fade-on", "fade-off"):
+                acc.fade = arg == "fade-on"
+            elif arg == "bench":
+                # tempo di ricalcolo stile + ridisegno per un cambio di colore
+                times = []
+                for i in range(10):
+                    t0 = time.time()
+                    acc._apply((40 + i * 20, 200 - i * 10, 120))
+                    self.win.queue_draw()
+                    while Gtk.events_pending():
+                        Gtk.main_iteration_do(False)
+                    times.append((time.time() - t0) * 1000)
+                acc._apply(acc.target)
+                print("bench accento ms:", " ".join(f"{t:.0f}" for t in times), flush=True)
+            else:
+                acc.from_cover(None if arg == "default" else arg)
+            print("accento:", acc.target, flush=True)
+        elif name.startswith("open:"):
+            # open:<playlist|album|artist>:<id>  (per i test)
+            _, kind, cid = name.split(":", 2)
+            self.win.show_main()
+            self.win.open(("detail", {"kind": kind, "id": cid, "uri": f"spotify:{kind}:{cid}",
+                                      "name": kind.capitalize(), "subtitle": "", "image": None}))
+        else:
+            self.win.show_main()
+            self.win.navigate_root((name,))
+
+    def do_activate(self):
+        if self.win is None:
+            self.win = DeskPlayer(self)
+            self.win.show_all()
+            self.win.toast.hide()
+            self.win.fullscreen()
+            self.win.on_login_changed(self.win.auth.logged_in)
+        else:
+            self.win.deiconify()
+            self.win.present()
+            self.win.refresh_player()
+
+
+if __name__ == "__main__":
+    App().run(None)
