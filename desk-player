@@ -1313,10 +1313,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         return False
 
     def go_home(self):
-        try:
-            Gio.Subprocess.new([os.path.expanduser("~/.local/bin/obc-home")], Gio.SubprocessFlags.NONE)
-        except GLib.Error:
-            pass
+        """Riduce a icona l'app: torna a quello che c'è dietro (desktop o altra schermata principale)."""
         self.iconify()
 
     # ---------------- utilità asincrone ----------------

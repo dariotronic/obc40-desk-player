@@ -52,7 +52,7 @@ fi
 mkdir -p "$BIN"
 cat > "$BIN/desk-player" <<'EOF'
 #!/bin/sh
-# obc40-desk-player launcher (written by install.sh)
+# obc40-desk-player wrapper (written by install.sh)
 D="$HOME/.local/share/obc40-desk-player"
 K=$(uname -r); KMAJ=${K%%.*}; KMIN=${K#*.}; KMIN=${KMIN%%.*}
 if [ "$KMAJ" -lt 5 ] || { [ "$KMAJ" -eq 5 ] && [ "$KMIN" -lt 8 ]; }; then
