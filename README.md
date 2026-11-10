@@ -32,14 +32,42 @@ The board has no audio output: the music plays on another Spotify device (PC, ph
 
 ## Install
 
-On the board, as the desktop user (no root needed):
+On the board, open a terminal **as the desktop user** (not root) and run **one line**:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/get.sh | sh -s -- --desktop-icon
+```
+
+To install the touch launcher [obc40-home](https://github.com/dariotronic/obc40-home) too, in one go:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/get.sh | sh -s -- --with-home --desktop-icon
+```
+
+[`get.sh`](get.sh) does the following:
+1. checks the system packages and, if some are missing, offers to install them with `su` (it asks for the root password);
+2. downloads the latest release and verifies its SHA-256 checksum;
+3. runs `install.sh`;
+4. starts the app.
+
+Options:
+- `--desktop-icon`: puts a "Musica" icon on the desktop;
+- `--autostart`: opens Desk Player at every login;
+- `--no-autostart`: for the launcher.
+
+Running it again reinstalls the latest version.
+
+<details><summary>Manual install, step by step</summary>
 
 ```sh
 cd /tmp
 wget https://github.com/dariotronic/obc40-desk-player/releases/latest/download/obc40-desk-player.tar.gz
+wget https://github.com/dariotronic/obc40-desk-player/releases/latest/download/obc40-desk-player.tar.gz.sha256
+sha256sum -c obc40-desk-player.tar.gz.sha256
 tar xzf obc40-desk-player.tar.gz
 sh obc40-desk-player/install.sh --desktop-icon     # add --autostart to open it at every login
 ```
+</details>
 
 Then open **Musica** from the menu, the desktop or the obc40-home tile.
 
@@ -49,7 +77,7 @@ Then open **Musica** from the menu, the desktop or the obc40-home tile.
    - **Redirect URI**: exactly `http://127.0.0.1:8888/callback`. Use `127.0.0.1`, not `localhost`.
    - **API**: tick **Web API**.
    - Copy the **Client ID**. Login uses PKCE, so no client secret is needed. The app can stay in development mode for personal use.
-2. **On your PC**, with Desk Player open on the display, start the tunnel. [`login-tunnel.py`](login-tunnel.py) is in this repository and in the release package:
+2. **On your PC**, with Desk Player open on the display, start the tunnel. Download [`login-tunnel.py`](https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/login-tunnel.py) from this repository:
    ```sh
    python login-tunnel.py <board-ip> --user <user> --key ~/.ssh/<private-key>
    ```
@@ -144,14 +172,13 @@ Issues and pull requests are welcome. Only the maintainers can push to this repo
 
 **Desk Player** trasforma il display touch 1024×600 della **OBC40** con **Alpine Linux e XFCE** in un telecomando Spotify a schermo intero. La musica suona su un altro dispositivo Spotify (PC, telefono, casse). **Serve Spotify Premium.**
 
-**Installazione**, sulla scheda con l'utente del desktop (non serve root; serve `apk add py3-gobject3 gtk+3.0`):
+**Installazione**: sulla scheda apri un terminale **con l'utente del desktop** (non root) e scrivi **una riga**:
 
 ```sh
-cd /tmp
-wget https://github.com/dariotronic/obc40-desk-player/releases/latest/download/obc40-desk-player.tar.gz
-tar xzf obc40-desk-player.tar.gz
-sh obc40-desk-player/install.sh --desktop-icon     # --autostart per aprirlo a ogni accesso
+wget -qO- https://raw.githubusercontent.com/dariotronic/obc40-desk-player/main/get.sh | sh -s -- --desktop-icon
 ```
+
+Per installare insieme anche il launcher obc40-home, aggiungi `--with-home`. Lo script controlla i pacchetti di sistema e, se ne manca qualcuno, si offre di installarli chiedendo la password di root. Poi scarica l'ultima versione, ne verifica il checksum, la installa e avvia l'app.
 
 **Login Spotify** (una volta sola):
 1. Crea un'app su <https://developer.spotify.com/dashboard>:
