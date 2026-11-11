@@ -29,6 +29,8 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
+gi.require_foreign("cairo")
+import cairo  # noqa: E402
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -187,22 +189,38 @@ def img_urls(j):
     return imgs[0].get("url"), imgs[-1].get("url")
 
 
+def img_mid(j, px=300):
+    """La più piccola immagine larga almeno `px` (Spotify di solito dà 640, 300 e 64 px)."""
+    imgs = [i for i in (j or {}).get("images") or [] if i.get("url")]
+    if not imgs:
+        return None
+    sized = [i for i in imgs if (i.get("width") or 0) >= px]
+    if sized:
+        return min(sized, key=lambda i: i["width"])["url"]
+    if any(i.get("width") for i in imgs):
+        return max(imgs, key=lambda i: i.get("width") or 0)["url"]
+    return imgs[len(imgs) // 2]["url"]  # senza dimensioni: quella di mezzo
+
+
 def parse_track(j, fallback_image=None, album_name=None, album_uri=None):
     if not j or not j.get("uri"):
         return None
     if j.get("type") == "episode":
         big, small = img_urls(j)
+        mid = img_mid(j)
         artists = (j.get("show") or {}).get("name", "")
         album = artists
         ctx = (j.get("show") or {}).get("uri")
     else:
         big, small = img_urls(j.get("album"))
+        mid = img_mid(j.get("album"))
         artists = ", ".join(a.get("name", "") for a in j.get("artists") or [])
         album = (j.get("album") or {}).get("name", "")
         ctx = (j.get("album") or {}).get("uri")
     artist_list = [(a.get("id"), a.get("name", "")) for a in j.get("artists") or [] if a.get("id")]
     return {"id": j.get("id"), "uri": j["uri"], "name": j.get("name") or "?", "artists": artists,
             "album": album_name or album, "image": big or fallback_image, "small": small or fallback_image,
+            "medium": mid or big or fallback_image,
             "duration": j.get("duration_ms") or 0, "album_uri": album_uri or ctx, "artist_list": artist_list,
             "added": "", "date": (j.get("album") or {}).get("release_date") or ""}
 
@@ -218,7 +236,7 @@ def parse_coll(j, kind):
     else:
         sub = "Artista"
     c = {"kind": kind, "id": j["id"], "uri": j.get("uri", ""), "name": j.get("name") or "?",
-         "subtitle": sub, "image": small or big}
+         "subtitle": sub, "image": small or big, "medium": img_mid(j) or big or small}
     if kind == "album":
         c["date"] = j.get("release_date") or ""
         c["type"] = release_type(j)
@@ -240,6 +258,8 @@ MONTHS = ("gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", 
 
 def played_label(iso):
     """Orario di un ascolto (ISO 8601 in UTC) nel fuso locale: "oggi 10:12", "ieri 23:40", "9 nov"."""
+    if iso == "now":
+        return "in riproduzione"
     try:
         dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
     except (AttributeError, ValueError):
@@ -363,7 +383,8 @@ class Spotify:
         return {"playing": bool(j.get("is_playing")), "track": parse_track(j.get("item")),
                 "progress": j.get("progress_ms") or 0, "fetched": time.time(),
                 "shuffle": bool(j.get("shuffle_state")), "repeat": j.get("repeat_state") or "off",
-                "device": parse_device(j.get("device")), "context": (j.get("context") or {}).get("uri")}
+                "device": parse_device(j.get("device")), "context": (j.get("context") or {}).get("uri"),
+                "disallows": {k for k, v in ((j.get("actions") or {}).get("disallows") or {}).items() if v}}
 
     def devices(self):
         return [d for d in (parse_device(x) for x in (self.call("GET", "me/player/devices") or {}).get("devices", [])) if d]
@@ -451,13 +472,33 @@ class Spotify:
         self.recent_by_uri = m
         return m
 
-    def recent_overview(self, max_age=15, max_colls=12):
+    def recent_overview(self, current=None, max_age=15, max_colls=12):
         """Scheda "Recenti": album e playlist da cui sono partiti gli ultimi 50 ascolti, poi i brani.
 
-        Ogni elemento ha "played", l'orario dell'ascolto più recente. Album e playlist vengono dal
-        contesto dell'ascolto, quindi compaiono anche se non sono salvati in libreria."""
+        Ogni elemento ha "played", l'orario dell'ascolto più recente ("now" se sta suonando). Album e
+        playlist vengono dal contesto dell'ascolto, quindi compaiono anche se non sono salvati.
+        current: (contesto, brano) in riproduzione; None = lo legge qui. Va in cima perché Spotify
+        lo aggiunge agli ascolti solo dopo circa 30 secondi."""
         items = self.recent_items(max_age=max_age)
         colls, seen_c, tracks, seen_t = [], set(), [], set()
+        if current is None:
+            p = self.player()
+            current = (p.get("context"), p["track"]) if p and p["track"] else (None, None)
+        ctx, cur = current
+        if cur and cur["uri"].startswith("spotify:track:"):
+            kind = ctx.split(":")[1] if ctx and ctx.count(":") == 2 else None
+            c = self._context_coll(kind, ctx, items) if kind in ("album", "playlist") else None
+            if not c and cur.get("album_uri"):
+                # nessun contesto (es. brano partito dalla ricerca): l'album del brano
+                c = {"kind": "album", "id": cur["album_uri"].rsplit(":", 1)[-1], "uri": cur["album_uri"],
+                     "name": cur["album"], "subtitle": cur["artists"], "image": cur["small"],
+                     "medium": cur.get("medium")}
+            if c:
+                c["played"] = "now"
+                colls.append(c)
+                seen_c.add(c["uri"])
+            tracks.append(dict(cur, played="now"))
+            seen_t.add(cur["uri"])
         for x in items:
             when = x.get("played_at") or ""
             t = parse_track(x.get("track"))
@@ -690,8 +731,8 @@ list row:active { background-color: #23262d; }
 .card { background-color: #1b1d23; border-radius: 12px; padding: 8px; }
 flowboxchild { padding: 0; }
 flowboxchild:active .card { background-color: #23262d; }
-button.cardbtn { background-color: rgba(16,17,20,0.85); background-image: none; border: none; border-radius: 999px;
-                 box-shadow: none; color: #ffffff; min-width: 34px; min-height: 34px; margin: 4px; padding: 0; }
+button.cardbtn { background: none; border: none; box-shadow: none; color: #9aa0aa;
+                 min-width: 30px; min-height: 30px; padding: 0; }
 button.cardbtn:active { color: @accent; }
 .fullnp { background-color: #101114; }
 .ftitle { font-size: 30px; font-weight: bold; color: #ffffff; }
@@ -719,37 +760,72 @@ IMG_GEN = [0]  # incrementato a ogni cambio pagina: scarta i download non più v
 
 
 def set_image(img, url, size, fallback="audio-x-generic-symbolic", keep=False):
-    """Carica un'immagine remota in un Gtk.Image (asincrono, con cache)."""
+    """Carica un'immagine remota in un Gtk.Image (asincrono, con cache).
+
+    url può essere una coppia (anteprima, definitiva): l'anteprima piccola compare subito
+    (spesso è già in cache dalla vista a elenco), poi viene sostituita da quella nitida."""
+    low, high = url if isinstance(url, tuple) else (url, url)
+    low, high = low or high, high or low
+    if size <= 80:
+        high = low  # miniature: basta l'immagine piccola
     img.set_from_icon_name(fallback, Gtk.IconSize.DIALOG)
     img.set_pixel_size(min(size, 64))
     img.set_size_request(size, size)
-    if not url:
+    if not high:
         return
-    key = (url, size)
+    key, lkey = (high, size), (low, size)
     img._want = key
     if key in IMG_CACHE:
         img.set_from_pixbuf(IMG_CACHE[key])
         return
+    if lkey in IMG_CACHE:
+        img.set_from_pixbuf(IMG_CACHE[lkey])
 
     gen = IMG_GEN[0]
+
+    def load(u, k, final):
+        pb = download_pixbuf(u)
+        if pb is None:
+            return
+        pb = cover_pixbuf(pb, size)
+        if len(IMG_CACHE) > 400:
+            IMG_CACHE.clear()
+        IMG_CACHE[k] = pb
+        # l'anteprima non copre mai quella definitiva, se è arrivata prima
+        GLib.idle_add(lambda: getattr(img, "_want", None) == key and (final or key not in IMG_CACHE)
+                      and img.set_from_pixbuf(pb) and False)
 
     def work():
         if not keep and gen != IMG_GEN[0]:
             return  # pagina cambiata nel frattempo
         try:
-            pb = download_pixbuf(url)
-            if pb is None:
+            if low != high and lkey not in IMG_CACHE:
+                load(low, lkey, False)
+            if not keep and gen != IMG_GEN[0]:
                 return
-            w, h = pb.get_width(), pb.get_height()
-            s = min(w, h)
-            pb = pb.new_subpixbuf((w - s) // 2, (h - s) // 2, s, s).scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
-            if len(IMG_CACHE) > 400:
-                IMG_CACHE.clear()
-            IMG_CACHE[key] = pb
-            GLib.idle_add(lambda: getattr(img, "_want", None) == key and img.set_from_pixbuf(pb) and False)
+            load(high, key, True)
         except Exception:
             pass
     IMG_POOL.submit(work)
+
+
+def cover_pixbuf(pb, size):
+    """Copertina come chiede Spotify: intera (nessun ritaglio), angoli arrotondati di 4 px (8 px se grande)."""
+    w, h = pb.get_width(), pb.get_height()
+    k = size / max(w, h)
+    w2, h2 = max(1, round(w * k)), max(1, round(h * k))
+    pb = pb.scale_simple(w2, h2, GdkPixbuf.InterpType.BILINEAR)
+    r = 8 if size >= 200 else 4
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w2, h2)
+    cr = cairo.Context(surf)
+    cr.new_sub_path()
+    for cx, cy, a in ((w2 - r, r, -90), (w2 - r, h2 - r, 0), (r, h2 - r, 90), (r, r, 180)):
+        cr.arc(cx, cy, r, math.radians(a), math.radians(a + 90))
+    cr.close_path()
+    cr.clip()
+    Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+    cr.paint()
+    return Gdk.pixbuf_get_from_surface(surf, 0, 0, w2, h2)
 
 
 def download_pixbuf(url):
@@ -1107,14 +1183,6 @@ class CardView:
             im = Gtk.Image()
             set_image(im, image, self.SIZE)
         ov.add(im)
-        if buttons:
-            bb = Gtk.Box(spacing=4, halign=Gtk.Align.END, valign=Gtk.Align.END)
-            for ic, cb, tip, *reg in buttons:
-                b = icon_button(ic, cb, cls="cardbtn", size=18, tip=tip)
-                if reg:
-                    reg[0](b)
-                bb.pack_start(b, False, False, 0)
-            ov.add_overlay(bb)
         card.pack_start(ov, False, False, 0)
         lt = label(title, "rtitle")
         lt.set_max_width_chars(1)
@@ -1126,6 +1194,15 @@ class CardView:
             ls = label(sub, "rsub")
             ls.set_max_width_chars(1)
             card.pack_start(ls, False, False, 0)
+        if buttons:
+            # sotto la copertina, mai sopra (Design Guidelines di Spotify)
+            bb = Gtk.Box(spacing=2, halign=Gtk.Align.END)
+            for ic, cb, tip, *reg in buttons:
+                b = icon_button(ic, cb, cls="cardbtn", size=18, tip=tip)
+                if reg:
+                    reg[0](b)
+                bb.pack_start(b, False, False, 0)
+            card.pack_start(bb, False, False, 0)
         card.set_size_request(self.SIZE, -1)
         ch.add(card)
         ch.action = action
@@ -1151,7 +1228,12 @@ class NowPlayingView:
         tcol = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2 if not full else 6)
         self.l_title = label("Niente in riproduzione", mk("ftitle", "title"), ellipsize=not full, wrap=full)
         self.l_artist = label("", mk("fartist", "artist"))
-        tcol.pack_start(self.l_title, False, False, 0)
+        title_ev = Gtk.EventBox()
+        title_ev.add(self.l_title)
+        if not full:
+            # il titolo troncato si legge per intero nella vista a tutto schermo
+            title_ev.connect("button-release-event", lambda *_: dp.show_full())
+        tcol.pack_start(title_ev, False, False, 0)
         art_ev = Gtk.EventBox()
         art_ev.add(self.l_artist)
         art_ev.connect("button-release-event", lambda *_: dp.open_current_artist())
@@ -1169,6 +1251,7 @@ class NowPlayingView:
         self.b_like = icon_button(LIKE_OFF, dp.toggle_like, size=30 if full else 22, tip="Mi piace")
         self.b_like.set_valign(Gtk.Align.START)
         self.b_like.set_no_show_all(True)
+        self.b_like._img.show()  # no_show_all vale anche per show_all() sul pulsante: l'icona va mostrata qui
         trow.pack_end(self.b_like, False, False, 0)
 
         # --- avanzamento ---
@@ -1185,10 +1268,10 @@ class NowPlayingView:
         big = 1.35 if full else 1.0
         ctr = Gtk.Box()
         self.b_shuffle = icon_button("media-playlist-shuffle-symbolic", dp.toggle_shuffle, size=int(24 * big), tip="Casuale")
-        b_prev = icon_button("media-skip-backward-symbolic", lambda: dp.act(dp.api.previous), size=int(30 * big))
+        self.b_prev = b_prev = icon_button("media-skip-backward-symbolic", lambda: dp.act(dp.api.previous), size=int(30 * big))
         self.b_play = icon_button("media-playback-start-symbolic", dp.toggle_play,
                                   cls=mk("playbtn-big", "playbtn"), size=int(32 * big))
-        b_next = icon_button("media-skip-forward-symbolic", lambda: dp.act(dp.api.next), size=int(30 * big))
+        self.b_next = b_next = icon_button("media-skip-forward-symbolic", lambda: dp.act(dp.api.next), size=int(30 * big))
         self.b_repeat = icon_button("media-playlist-repeat-symbolic", dp.cycle_repeat, size=int(24 * big), tip="Ripeti")
         for b in (self.b_shuffle, b_prev, self.b_play, b_next, self.b_repeat):
             b.set_valign(Gtk.Align.CENTER)
@@ -1280,6 +1363,16 @@ class NowPlayingView:
         if not t:
             self.set_position(0, 0)
         self.set_liked(liked)
+        # comandi vietati da Spotify in questo momento (PlaybackRestrictions): disattivati
+        no = p["disallows"] if p else set()
+        playing = bool(p and p["playing"])
+        # senza player restano attivi: Play riprende sull'ultimo dispositivo usato
+        self.b_play.set_sensitive(("pausing" if playing else "resuming") not in no)
+        self.b_prev.set_sensitive("skipping_prev" not in no)
+        self.b_next.set_sensitive("skipping_next" not in no)
+        self.b_shuffle.set_sensitive("toggling_shuffle" not in no)
+        self.b_repeat.set_sensitive(not {"toggling_repeat_context", "toggling_repeat_track"} <= no)
+        self.progress.set_sensitive(bool(t) and "seeking" not in no)
 
     def set_liked(self, liked):
         """liked: True/False, oppure None se il cuore non va mostrato (episodio, scope mancante…)."""
@@ -1584,7 +1677,13 @@ class DeskPlayer(Gtk.ApplicationWindow):
             if time.time() < self.hold_until:
                 return False
             old_uri = self.player["track"]["uri"] if self.player and self.player["track"] else None
+            old_ctx = self.player.get("context") if self.player else None
             self.player = p
+            # cambiato l'album o la playlist in riproduzione: la scheda Recenti lo mette in cima
+            if (p and p["track"] and p.get("context") != old_ctx and old_ctx is not None
+                    and self.stack == [("library",)] and self.lib_tab == "recent"
+                    and not getattr(self, "_sort_modal", None)):
+                GLib.idle_add(lambda: self.render() and False)
             if p and p["playing"]:
                 self.last_activity = time.time()
             self.warn_missing_scopes()
@@ -1748,7 +1847,8 @@ class DeskPlayer(Gtk.ApplicationWindow):
 
         def done(_):
             self.liked_state = None  # la pagina Preferiti va riletta
-            self.show_toast(f"Aggiunto ai Preferiti: {t['name']}" if on else f"Tolto dai Preferiti: {t['name']}")
+            self.show_toast(f"Aggiunto a Brani che ti piacciono: {t['name']}" if on
+                            else f"Rimosso da Brani che ti piacciono: {t['name']}")
             return False
 
         def fail(e):
@@ -2117,7 +2217,8 @@ class DeskPlayer(Gtk.ApplicationWindow):
             buttons.append(("list-add-symbolic", lambda t=t: self.enqueue(t), "Aggiungi alla coda"))
             if removable:
                 buttons.append(("list-remove-symbolic", lambda t=t: self.unqueue(t), "Rimuovi dalla coda"))
-            self.add_row(view, t["name"], t["artists"], image=t["small"] if thumbs or self.cards else None,
+            image = (t["small"], t.get("medium")) if self.cards else (t["small"] if thumbs else None)
+            self.add_row(view, t["name"], t["artists"], image=image,
                          number=None if thumbs else i + 1, current=t["uri"] == cur, uri=t["uri"],
                          action=(lambda i=i: on_play(i)) if on_play else None, buttons=buttons,
                          extra=fmt(t["duration"]))
@@ -2128,7 +2229,8 @@ class DeskPlayer(Gtk.ApplicationWindow):
             buttons = []
             if c["kind"] != "artist":
                 buttons = [("media-playback-start-symbolic", lambda c=c: self.play_context(c["uri"]), "Riproduci")]
-            self.add_row(view, c["name"], c["subtitle"], image=c["image"], round_img=c["kind"] == "artist",
+            image = (c["image"], c.get("medium")) if self.cards else c["image"]
+            self.add_row(view, c["name"], c["subtitle"], image=image, round_img=c["kind"] == "artist",
                          action=lambda c=c: self.open(("detail", c)), buttons=buttons, current=c["uri"] == cur)
 
     def empty(self, view, text):
@@ -2206,7 +2308,10 @@ class DeskPlayer(Gtk.ApplicationWindow):
                 self.add_tracks(lb, tracks, lambda i: self.play_track(tracks[i]))
             if not data["colls"] and not tracks:
                 self.empty(lb, "Nessun ascolto recente")
-        self.load(self.content, None, self.with_saved(self.api.recent_overview, lambda d: d["tracks"]), build)
+        p = self.player
+        current = (p.get("context"), p["track"]) if p and p["track"] else None  # None: la legge recent_overview
+        self.load(self.content, None, self.with_saved(lambda: self.api.recent_overview(current), lambda d: d["tracks"]),
+                  build)
 
     def reload_library(self):
         self.cache.pop("lib:" + self.lib_tab, None)

@@ -12,7 +12,7 @@ The board has no audio output: the music plays on another Spotify device (PC, ph
 
 - **Now playing**: cover, title, artist (tap the artist to open their page), seek bar, play/pause, previous/next, shuffle, repeat, volume and current device. A ⛶ button opens a fullscreen view.
 - **Liked Songs**: a ♥ next to the current track and on every track in lists adds it to, or removes it from, your Liked Songs.
-- **Library**: opens on **Recenti** (recently played): the albums and playlists you played, even if they are not saved, with the time of the last play, then the tracks. Then saved albums, followed artists, playlists and liked songs (loaded 100 at a time, then 50 more each time you reach the bottom).
+- **Library**: opens on **Recenti** (recently played): what is playing now on top, then the albums and playlists you played, even if they are not saved, with the time of the last play, then the tracks. Then saved albums, followed artists, playlists and liked songs (loaded 100 at a time, then 50 more each time you reach the bottom).
 - **Search** for tracks, artists, albums and your own playlists.
 - **Queue**, with add (+) and remove (−).
 - **Devices**: move playback to another device.
@@ -21,6 +21,7 @@ The board has no audio output: the music plays on another Spotify device (PC, ph
 - **Sorting**: date added, release date, recently played or name, ascending or descending. Each page only offers the options that make sense for it.
 - **List or card view**. Albums, playlists and the queue always use the list.
 - **Accent colour** taken from the album cover, always readable on the dark background.
+- **Covers** are shown whole, with slightly rounded corners and nothing on top of them. In card view a sharp 300 px image replaces the small preview as soon as it loads.
 - Built for touch: no tooltips, no dashed focus rings, works with the onboard on-screen keyboard.
 - The 🏠 button minimises Desk Player and shows whatever is behind it.
 
@@ -103,6 +104,7 @@ These come from the Spotify Web API or the platform. They are not bugs to fix.
 | The API cannot remove tracks from the queue | A removed track is hidden and skipped when it starts, as long as the app is running |
 | Spotify limits how many requests an app can make (HTTP 429) | Desk Player waits as long as Spotify asks (`Retry-After`), checks the player less often when nothing plays, and not at all while minimised |
 | "Recently played" only covers the last 50 plays | Items without data go to the bottom |
+| Spotify adds a track to "recently played" only after about 30 seconds of listening | Recenti shows what is playing now on top |
 | Followed playlists and artists have no dates | Those pages offer no date-based sorting |
 | On the 4.14 kernel, recent musl and GLib use `faccessat2` (kernel 5.8 or newer), so GLib file checks always fail | The wrapper preloads [`faccessat-fix`](faccessat-fix/) |
 

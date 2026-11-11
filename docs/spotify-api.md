@@ -31,6 +31,16 @@ Rules for anyone changing how Desk Player talks to Spotify, people and coding as
 - 403, 404, 400: show Spotify's `error.message`, or a clearer Italian text for known cases (`NO_ACTIVE_DEVICE`, `PREMIUM_REQUIRED`, playlists of other users).
 - 429: one message per wait, not one per tap.
 
+## Design
+
+Desk Player follows part of Spotify's [Design Guidelines](https://developer.spotify.com/documentation/design):
+
+- covers are shown whole: never cropped, nothing drawn on top of them (card buttons sit below), corners rounded by 4 px (8 px on large covers);
+- playback buttons that Spotify disallows at the moment (`actions.disallows` in `GET me/player`) are disabled;
+- the like action says "Aggiunto a / Rimosso da Brani che ti piacciono".
+
+By the maintainer's choice, Desk Player keeps the heart icon, a draggable seek bar, the accent colour taken from the cover and full-length lists, and shows no Spotify logo or "Listen on Spotify" links.
+
 ## Spotify Developer Terms
 
 - Read the [Developer Terms](https://developer.spotify.com/terms) before adding features.
