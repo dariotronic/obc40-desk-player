@@ -145,6 +145,8 @@ class Auth:
         self.data["expires_at"] = time.time() + j.get("expires_in", 3600) - 60
         if j.get("refresh_token"):
             self.data["refresh_token"] = j["refresh_token"]
+        if j.get("scope") is not None:
+            self.data["scope"] = j["scope"]  # gli scope concessi: un vecchio token non ha quelli nuovi
         save_json(AUTH_FILE, self.data)
 
     def token(self, force=False):
@@ -164,8 +166,15 @@ class Auth:
                 raise
             return self.data["access_token"]
 
+    def missing_scopes(self):
+        """Scope richiesti da questa versione ma non concessi al token (vuoto se non si sa ancora)."""
+        granted = self.data.get("scope")
+        if granted is None:
+            return set()
+        return set(SCOPES.split()) - set(granted.split())
+
     def logout(self):
-        for k in ("access_token", "refresh_token", "expires_at"):
+        for k in ("access_token", "refresh_token", "expires_at", "scope"):
             self.data.pop(k, None)
         save_json(AUTH_FILE, self.data)
         GLib.idle_add(self.on_login, False)
@@ -530,6 +539,22 @@ class Spotify:
         tracks = [t for t in (parse_track(x, big or coll["image"], coll["name"], coll["uri"]) for x in items) if t]
         artists = ", ".join(a.get("name", "") for a in j.get("artists") or [])
         return {"tracks": tracks, "date": j.get("release_date") or "", "type": release_type(j), "artists": artists}
+
+    LIBRARY_BATCH = 40  # massimo di URI per chiamata a /me/library
+
+    def in_library(self, uris):
+        """URI -> True/False: se brani, album o playlist sono nella libreria (i brani: Preferiti)."""
+        uris = [u for u in dict.fromkeys(uris) if u]
+        out = {}
+        for i in range(0, len(uris), self.LIBRARY_BATCH):
+            part = uris[i:i + self.LIBRARY_BATCH]
+            res = self.call("GET", "me/library/contains?" + urllib.parse.urlencode({"uris": ",".join(part)})) or []
+            out.update(zip(part, res))
+        return out
+
+    def set_in_library(self, uri, on):
+        """Aggiunge o toglie un elemento dalla libreria (per un brano: mi piace / non mi piace più)."""
+        self.call("PUT" if on else "DELETE", "me/library?" + urllib.parse.urlencode({"uris": uri}))
 
     def me_id(self):
         if not getattr(self, "_me", None):
@@ -927,6 +952,15 @@ class Accent:
         IMG_POOL.submit(work)
 
 
+# cuore pieno (color accento) se il brano è nei Preferiti, vuoto se no: icone in icons/ dell'app
+LIKE_ON, LIKE_OFF = "dp-heart-filled-symbolic", "dp-heart-outline-symbolic"
+
+
+def set_like(btn, on):
+    DeskPlayer.set_icon(btn, LIKE_ON if on else LIKE_OFF)
+    DeskPlayer.set_on(btn, on)
+
+
 def icon_button(icon, cb, cls="flat", size=24, tip=None):
     b = Gtk.Button()
     img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
@@ -1007,8 +1041,11 @@ class ListView:
         trail = Gtk.Box(spacing=2)
         if extra:
             trail.pack_start(label(extra, "rsub", ellipsize=False), False, False, 4)
-        for ic, cb, tip in buttons:
-            trail.pack_start(icon_button(ic, cb, tip=tip), False, False, 0)
+        for ic, cb, tip, *reg in buttons:
+            b = icon_button(ic, cb, tip=tip)
+            if reg:
+                reg[0](b)  # chi crea la riga tiene il pulsante per aggiornarne lo stato
+            trail.pack_start(b, False, False, 0)
         box.pack_end(trail, False, False, 0)
         row.add(box)
         row.action = action
@@ -1072,8 +1109,11 @@ class CardView:
         ov.add(im)
         if buttons:
             bb = Gtk.Box(spacing=4, halign=Gtk.Align.END, valign=Gtk.Align.END)
-            for ic, cb, tip in buttons:
-                bb.pack_start(icon_button(ic, cb, cls="cardbtn", size=18, tip=tip), False, False, 0)
+            for ic, cb, tip, *reg in buttons:
+                b = icon_button(ic, cb, cls="cardbtn", size=18, tip=tip)
+                if reg:
+                    reg[0](b)
+                bb.pack_start(b, False, False, 0)
             ov.add_overlay(bb)
         card.pack_start(ov, False, False, 0)
         lt = label(title, "rtitle")
@@ -1126,6 +1166,10 @@ class NowPlayingView:
             self.l_album = label("", "falbum")
             tcol.pack_start(self.l_album, False, False, 0)
         trow.pack_start(tcol, True, True, 0)
+        self.b_like = icon_button(LIKE_OFF, dp.toggle_like, size=30 if full else 22, tip="Mi piace")
+        self.b_like.set_valign(Gtk.Align.START)
+        self.b_like.set_no_show_all(True)
+        trow.pack_end(self.b_like, False, False, 0)
 
         # --- avanzamento ---
         self.progress = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.001)
@@ -1235,6 +1279,12 @@ class NowPlayingView:
         self.l_device.set_text(f"Su: {d['name']}" if d else "")
         if not t:
             self.set_position(0, 0)
+        self.set_liked(liked)
+
+    def set_liked(self, liked):
+        """liked: True/False, oppure None se il cuore non va mostrato (episodio, scope mancante…)."""
+        self.b_like.set_visible(liked is not None)
+        set_like(self.b_like, bool(liked))
 
 
 class TouchFocus:
@@ -1283,7 +1333,9 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.liked_state = None
         self.artist_filter = "all"
         self.player = None
-        self.liked = False
+        self.saved = {}          # URI del brano -> nei Preferiti? (solo in memoria, per la sessione)
+        self.like_buttons = []   # (URI, pulsante) dei cuori nella pagina corrente
+        self.scope_warned = False
         self.hold_until = 0
         self.pending_seek = None
         self.pending_vol = None
@@ -1510,19 +1562,32 @@ class DeskPlayer(Gtk.ApplicationWindow):
         # ogni lettura, anche quelle fuori dal timer, sposta in avanti la successiva
         self.last_refresh, self.next_poll = now, now + self.poll_interval()
 
+        known_uri = self.player["track"]["uri"] if self.player and self.player["track"] else None
+
         def fetch():
-            return self.api.player(), None
+            p = self.api.player()
+            uri = p["track"]["uri"] if p and p["track"] else None
+            liked = None
+            # lo stato del cuore si rilegge a ogni cambio di brano (può cambiare da un altro dispositivo)
+            if uri and uri.startswith("spotify:track:") and self.can_like() and (
+                    uri != known_uri or uri not in self.saved):
+                try:
+                    liked = self.api.in_library([uri]).get(uri)
+                except ApiError:
+                    pass
+            return p, (uri, liked)
 
         def done(res):
-            p, liked = res
+            p, (uri, liked) = res
+            if liked is not None:
+                self.saved[uri] = liked
             if time.time() < self.hold_until:
                 return False
             old_uri = self.player["track"]["uri"] if self.player and self.player["track"] else None
             self.player = p
             if p and p["playing"]:
                 self.last_activity = time.time()
-            if liked is not None:
-                self.liked = liked
+            self.warn_missing_scopes()
             if p and p["device"] and p["device"]["id"] and p["device"]["id"] != self.state.get("last_device"):
                 self.state["last_device"] = p["device"]["id"]
                 save_json(STATE_FILE, self.state)
@@ -1554,9 +1619,16 @@ class DeskPlayer(Gtk.ApplicationWindow):
                 np.set_position(pos, p["track"]["duration"])
         return True
 
+    def current_liked(self):
+        """Stato del cuore per il brano in riproduzione (None: niente cuore)."""
+        t = self.player["track"] if self.player else None
+        if not t or not t["uri"].startswith("spotify:track:") or not self.can_like():
+            return None
+        return self.saved.get(t["uri"], False)
+
     def update_player_ui(self, track_changed=False):
         for np in self.panels:
-            np.update(self.player, self.liked, track_changed, self.pending_vol)
+            np.update(self.player, self.current_liked(), track_changed, self.pending_vol)
         if track_changed:
             self.highlight_current()
             t = self.player["track"] if self.player else None
@@ -1649,6 +1721,67 @@ class DeskPlayer(Gtk.ApplicationWindow):
             else:
                 self.api.play(dev, {"uris": [t["uri"]]})
         self.act(run)
+
+    LIKE_SCOPES = {"user-library-read", "user-library-modify"}
+
+    def can_like(self):
+        return not (self.auth.missing_scopes() & self.LIKE_SCOPES)
+
+    def warn_missing_scopes(self):
+        """Una volta per sessione: se il token non ha tutti gli scope di questa versione, lo dice."""
+        if self.scope_warned or not self.auth.missing_scopes():
+            return
+        self.scope_warned = True
+        self.show_toast("Per alcune funzioni serve un nuovo accesso: Dispositivi → Esci dall'account, poi ricollegati")
+
+    def toggle_like(self):
+        t = self.player["track"] if self.player else None
+        if t:
+            self.toggle_saved(t)
+
+    def toggle_saved(self, t):
+        """Mette o toglie il brano dai Preferiti: il cuore cambia subito, torna indietro se Spotify rifiuta."""
+        uri = t["uri"]
+        on = not self.saved.get(uri, False)
+        self.saved[uri] = on
+        self.refresh_likes(uri)
+
+        def done(_):
+            self.liked_state = None  # la pagina Preferiti va riletta
+            self.show_toast(f"Aggiunto ai Preferiti: {t['name']}" if on else f"Tolto dai Preferiti: {t['name']}")
+            return False
+
+        def fail(e):
+            self.saved[uri] = not on
+            self.refresh_likes(uri)
+            return self.on_error(e)
+        self.bg(lambda: self.api.set_in_library(uri, on), done, fail)
+
+    def register_like(self, uri, btn):
+        self.like_buttons.append((uri, btn))
+        set_like(btn, self.saved.get(uri, False))
+
+    def refresh_likes(self, uri):
+        for u, b in self.like_buttons:
+            if u == uri:
+                set_like(b, self.saved.get(u, False))
+        cur = self.current_liked()
+        for np in self.panels:
+            np.set_liked(cur)
+
+    def with_saved(self, fn, tracks_of, limit=200):
+        """Dopo il caricamento legge quali brani sono nei Preferiti (al massimo `limit`, 40 per richiesta)."""
+        def run():
+            data = fn()
+            if self.can_like():
+                uris = [t["uri"] for t in tracks_of(data) if t and t["uri"].startswith("spotify:track:")]
+                todo = [u for u in dict.fromkeys(uris) if u not in self.saved][:limit]
+                try:
+                    self.saved.update(self.api.in_library(todo))
+                except ApiError:
+                    pass
+            return data
+        return run
 
     def enqueue(self, t):
         def done(_):
@@ -1903,6 +2036,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
             self.content.remove(c)
             c.destroy()
         self.track_labels = []
+        self.like_buttons = []
 
     def render(self):
         self.token += 1
@@ -1976,7 +2110,11 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def add_tracks(self, view, tracks, on_play, thumbs=True, removable=False):
         cur = self.player["track"]["uri"] if self.player and self.player["track"] else None
         for i, t in enumerate(tracks):
-            buttons = [("list-add-symbolic", lambda t=t: self.enqueue(t), "Aggiungi alla coda")]
+            buttons = []
+            if self.can_like() and t["uri"].startswith("spotify:track:"):
+                buttons.append((LIKE_OFF, lambda t=t: self.toggle_saved(t), "Mi piace",
+                                lambda b, u=t["uri"]: self.register_like(u, b)))
+            buttons.append(("list-add-symbolic", lambda t=t: self.enqueue(t), "Aggiungi alla coda"))
             if removable:
                 buttons.append(("list-remove-symbolic", lambda t=t: self.unqueue(t), "Rimuovi dalla coda"))
             self.add_row(view, t["name"], t["artists"], image=t["small"] if thumbs or self.cards else None,
@@ -2068,7 +2206,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
                 self.add_tracks(lb, tracks, lambda i: self.play_track(tracks[i]))
             if not data["colls"] and not tracks:
                 self.empty(lb, "Nessun ascolto recente")
-        self.load(self.content, None, self.api.recent_overview, build)
+        self.load(self.content, None, self.with_saved(self.api.recent_overview, lambda d: d["tracks"]), build)
 
     def reload_library(self):
         self.cache.pop("lib:" + self.lib_tab, None)
@@ -2104,7 +2242,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
                 if not any(r.values()):
                     self.empty(lb, "Nessun risultato")
             self.token += 1
-            self.load(results, "search:" + q, lambda: self.api.search(q), build)
+            self.load(results, "search:" + q, self.with_saved(lambda: self.api.search(q), lambda r: r["tracks"]), build)
         entry.connect("search-changed", run_search)  # GTK aspetta già ~150 ms dopo la digitazione
         # niente focus automatico: la tastiera si apre solo toccando il campo di testo
         if self.search_text:
@@ -2127,7 +2265,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         h = Gtk.Box(); h.set_margin_start(14)
         h.pack_end(icon_button("view-refresh-symbolic", self.render, tip="Aggiorna"), False, False, 8)
         self.content.pack_start(h, False, False, 0)
-        self.load(self.content, None, self.api.queue, build)
+        self.load(self.content, None, self.with_saved(self.api.queue, lambda d: [d[0]] + d[1]), build)
 
     def check_updates(self):
         obc_update.UpdateDialog(self.overlay, NAME, REPO, APP_DIR, WRAPPER,
@@ -2141,6 +2279,11 @@ class DeskPlayer(Gtk.ApplicationWindow):
         h.pack_end(out, False, False, 8)
         h.pack_end(icon_button("view-refresh-symbolic", self.render, tip="Aggiorna"), False, False, 0)
         self.content.pack_start(h, False, False, 0)
+        if self.auth.missing_scopes():
+            warn = label("Questa versione ha bisogno di nuovi permessi Spotify: tocca \"Esci dall'account\", "
+                         "poi ricollegati dal PC come la prima volta.", "rsub", ellipsize=False, wrap=True)
+            warn.set_margin_start(16); warn.set_margin_end(16); warn.set_margin_bottom(4)
+            self.content.pack_start(warn, False, False, 0)
         foot = Gtk.Box(spacing=10)
         foot.set_margin_start(16); foot.set_margin_end(12); foot.set_margin_bottom(8)
         foot.pack_start(label(f"Desk Player {obc_update.read_version(APP_DIR)}", "rsub", ellipsize=False), False, False, 0)
@@ -2206,6 +2349,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
             def done(res):
                 st["loading"] = False
                 st["items"] += res[0]; st["total"] = res[1]
+                self.saved.update((t["uri"], True) for t in res[0])
                 print(f"preferiti caricati: {len(st['items'])} di {st['total']}", flush=True)
                 if token == self.token:
                     build_list(scroll_to=pos)
@@ -2232,6 +2376,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
 
         def built(_container, res):
             st["items"], st["total"] = res
+            self.saved.update((t["uri"], True) for t in res[0])
             build_list()
         self.load(holder, None, first, built)
 
@@ -2261,6 +2406,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
                 self.empty(lb, "Nessun brano")
             self.add_tracks(lb, tracks, lambda i: self.play_context(c["uri"], tracks[i]["uri"]),
                             thumbs=c["kind"] == "playlist")
+        fn = self.with_saved(fn, lambda d: d["tracks"])
         self.load(self.content, "detail:" + c["id"], self.with_recent(fn) if c["kind"] == "playlist" else fn, build)
 
     def artist_page(self, c):
@@ -2297,6 +2443,7 @@ class App(Gtk.Application):
     def do_startup(self):
         Gtk.Application.do_startup(self)
         Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        Gtk.IconTheme.get_default().append_search_path(os.path.join(APP_DIR, "icons"))  # icone dell'app
         prov = Gtk.CssProvider(); prov.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)

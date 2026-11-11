@@ -11,6 +11,7 @@ The board has no audio output: the music plays on another Spotify device (PC, ph
 ## Features
 
 - **Now playing**: cover, title, artist (tap the artist to open their page), seek bar, play/pause, previous/next, shuffle, repeat, volume and current device. A ⛶ button opens a fullscreen view.
+- **Liked Songs**: a ♥ next to the current track and on every track in lists adds it to, or removes it from, your Liked Songs.
 - **Library**: opens on **Recenti** (recently played): the albums and playlists you played, even if they are not saved, with the time of the last play, then the tracks. Then saved albums, followed artists, playlists and liked songs (loaded 100 at a time, then 50 more each time you reach the bottom).
 - **Search** for tracks, artists, albums and your own playlists.
 - **Queue**, with add (+) and remove (−).
@@ -99,7 +100,6 @@ These come from the Spotify Web API or the platform. They are not bugs to fix.
 |---|---|
 | Playing a list of `uris` returns 204 but nothing plays, at least on the desktop client | Every track starts inside a **context** with an offset: its album, or your Liked Songs collection |
 | Tracks of playlists owned by **other users** return 403, even if you follow them: the API only serves playlists you own or collaborate on | Search only shows your own playlists. Opening someone else's playlist shows a message; ▶ still tries to play it |
-| Saving or removing liked songs with `PUT/DELETE me/tracks` returns 403, and those endpoints are now deprecated | No "like" button yet |
 | The API cannot remove tracks from the queue | A removed track is hidden and skipped when it starts, as long as the app is running |
 | Spotify limits how many requests an app can make (HTTP 429) | Desk Player waits as long as Spotify asks (`Retry-After`), checks the player less often when nothing plays, and not at all while minimised |
 | "Recently played" only covers the last 50 plays | Items without data go to the bottom |
@@ -123,6 +123,7 @@ The code is plain Python 3 + GTK 3 with no build step.
 | `desk-player` | the app |
 | `obc_update.py` | the in-app updater (GitHub Releases) |
 | `login-tunnel.py` | runs on the PC |
+| `icons/` | the app's own symbolic icons (empty and full heart) |
 | `dev/` | test helpers to run on the board |
 | `docs/spotify-api.md` | rules for working with the Spotify Web API: read it before changing API calls |
 
@@ -204,7 +205,6 @@ Lo script controlla i pacchetti di sistema e, se ne manca qualcuno, si offre di 
 
 **Limiti noti**: sono dell'API di Spotify, vedi la tabella [Known limits](#known-limits).
 - Le playlist di altri utenti non mostrano i brani.
-- Il "mi piace" non è disponibile.
 - I brani rimossi dalla coda vengono saltati.
 - "Ascoltato" considera solo gli ultimi 50 ascolti.
 

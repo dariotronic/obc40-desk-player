@@ -16,7 +16,7 @@ Rules for anyone changing how Desk Player talks to Spotify, people and coding as
 
 - Authorization Code with PKCE only. No client secret anywhere. Never the Implicit Grant.
 - Redirect URI: `http://127.0.0.1:8888/callback`. Never `localhost`, never wildcards.
-- Scopes: only those a feature actually uses (`SCOPES` in `desk-player`). Every scope must have a caller. A token keeps the scopes it was issued with, so adding one means the user has to sign in again.
+- Scopes: only those a feature actually uses (`SCOPES` in `desk-player`). Every scope must have a caller. A token keeps the scopes it was issued with, so adding one means the user has to sign in again. Desk Player saves the granted scopes (`scope` in `auth.json`) at every token refresh; when some are missing it hides the features that need them and asks the user to sign in again (`Auth.missing_scopes`).
 - Tokens live in `~/.config/desk-player/auth.json` (mode 600, folder 700). Save the new refresh token whenever Spotify returns one. If the refresh token is rejected (`invalid_grant`), sign out and show the login screen.
 
 ## Rate limits
