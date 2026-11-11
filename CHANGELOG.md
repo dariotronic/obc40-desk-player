@@ -2,6 +2,11 @@
 
 All notable changes to obc40-desk-player. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.0.4
+
+- Liked Songs: tap the ♥ next to the current track, or on any track in a list, to add it to your Liked Songs or remove it. It uses Spotify's current library endpoint.
+- If Spotify has not granted all the permissions this version needs, Desk Player says so once and shows how to sign in again (Dispositivi → Esci dall'account).
+
 ## 0.0.3
 
 - The library opens on the new **Recenti** tab: the albums and playlists you played recently, even if they are not in your library, with the time of the last play, then the tracks. The tabs are now Recenti, Album, Artisti, Playlist, Preferiti.
