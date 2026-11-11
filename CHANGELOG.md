@@ -2,6 +2,16 @@
 
 All notable changes to obc40-desk-player. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.0.5
+
+- Fixed: the ♥ next to the current track now shows; in 0.0.4 it stayed hidden.
+- Sharper covers in card view: the small preview appears at once and is replaced by a 300 px image as soon as it loads.
+- Recenti shows on top the album or playlist that is playing and its track: Spotify adds a track to its history only after about 30 seconds.
+- Covers are shown whole, never cropped, with slightly rounded corners; in card view the buttons sit below the cover instead of on top of it.
+- Playback buttons that Spotify does not allow at the moment are disabled.
+- Tap the title in the side panel to read it in full in the fullscreen view.
+- The ♥ messages now say "Aggiunto a Brani che ti piacciono" and "Rimosso da Brani che ti piacciono".
+
 ## 0.0.4
 
 - Liked Songs: tap the ♥ next to the current track, or on any track in a list, to add it to your Liked Songs or remove it. It uses Spotify's current library endpoint.
