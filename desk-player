@@ -8,10 +8,13 @@ One-time login from a PC (the board's sshd does not allow `ssh -L`):
 then open http://127.0.0.1:8888 in the PC browser.
 """
 import base64
+import datetime
 import hashlib
 import html
 import json
+import math
 import os
+import random
 import secrets
 import sys
 import threading
@@ -44,6 +47,7 @@ SCOPES = ("user-read-playback-state user-modify-playback-state user-read-current
           "user-library-read user-library-modify playlist-read-private playlist-read-collaborative "
           "user-follow-read user-read-recently-played")
 API = "https://api.spotify.com/v1/"
+CACHE_TTL = 30 * 60  # le liste di Spotify restano in memoria al massimo 30 minuti
 
 
 # ======================================================================
@@ -58,8 +62,17 @@ def load_json(path):
         return {}
 
 
+def private_conf_dir():
+    """La cartella con login e preferenze è leggibile solo dall'utente (700), anche se esisteva già."""
+    os.makedirs(CONF_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(CONF_DIR, 0o700)
+    except OSError:
+        pass
+
+
 def save_json(path, data):
-    os.makedirs(CONF_DIR, exist_ok=True)
+    private_conf_dir()
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f)
@@ -213,6 +226,23 @@ def release_type(j):
     return "EP" if (j.get("total_tracks") or 0) >= 4 else "Singolo"
 
 
+MONTHS = ("gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic")
+
+
+def played_label(iso):
+    """Orario di un ascolto (ISO 8601 in UTC) nel fuso locale: "oggi 10:12", "ieri 23:40", "9 nov"."""
+    try:
+        dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except (AttributeError, ValueError):
+        return ""
+    days = (datetime.date.today() - dt.date()).days
+    if days == 0:
+        return dt.strftime("oggi %H:%M")
+    if days == 1:
+        return dt.strftime("ieri %H:%M")
+    return f"{dt.day} {MONTHS[dt.month - 1]}"
+
+
 def fmt_long(ms):
     m = int(ms // 60000)
     return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
@@ -237,8 +267,31 @@ def parse_device(j):
 
 
 class Spotify:
+    MAX_BACKOFF = 60
+
     def __init__(self, auth):
         self.auth = auth
+        self.blocked_until = 0  # dopo un 429 nessuna chiamata parte prima di questo istante
+        self.backoff = 0        # ultima attesa usata quando manca Retry-After (secondi)
+        self.rl_lock = threading.Lock()
+        self._recent = (0, None)
+        self.recent_by_uri = {}  # ultima mappa calcolata da recent_map(), letta dall'ordinamento
+        self._ctx_cache = {}     # URI di album/playlist -> (istante, scheda), per i contesti degli ascolti
+
+    def rate_limited(self):
+        """Secondi che mancano alla fine del blocco per rate limit (0 se non c'è)."""
+        return max(0, self.blocked_until - time.time())
+
+    def _throttle(self, retry_after):
+        """Su un 429: rispetta Retry-After, altrimenti backoff esponenziale con jitter."""
+        with self.rl_lock:
+            try:
+                wait = max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                self.backoff = min(self.MAX_BACKOFF, self.backoff * 2 or 1)
+                wait = self.backoff + random.uniform(0, self.backoff / 2)
+            self.blocked_until = max(self.blocked_until, time.time() + wait)
+            return self.blocked_until - time.time()
 
     @staticmethod
     def _open(req, retries):
@@ -255,6 +308,9 @@ class Spotify:
                 time.sleep(0.6 * (i + 1))
 
     def call(self, method, path, body=None):
+        wait = self.rate_limited()
+        if wait:
+            raise ApiError(429, None, f"Spotify chiede di rallentare: riprovo tra {math.ceil(wait)} s")
         for attempt in range(2):
             token = self.auth.token(force=attempt > 0)
             data = json.dumps(body).encode() if body is not None else (b"" if method != "GET" else None)
@@ -263,6 +319,7 @@ class Spotify:
                                                   "Content-Type": "application/json"})
             try:
                 text = self._open(req, retries=3 if method == "GET" else 1)
+                self.backoff = 0
                 # alcuni comandi (es. pausa) rispondono con testo non JSON: va bene lo stesso
                 try:
                     return json.loads(text) if text.strip() else None
@@ -282,22 +339,12 @@ class Spotify:
                 elif reason == "PREMIUM_REQUIRED":
                     msg = "Serve Spotify Premium"
                 elif e.code == 429:
-                    msg = "Troppe richieste, attendo un attimo"
+                    wait = self._throttle(e.headers.get("Retry-After"))
+                    msg = f"Spotify chiede di rallentare: riprovo tra {math.ceil(wait)} s"
                 else:
                     msg = (err.get("message") if isinstance(err, dict) else None) or f"Errore {e.code}"
                 raise ApiError(e.code, reason, msg) from None
         raise ApiError(401, None, "Accesso non autorizzato")
-
-    def first_ok(self, *paths):
-        last = None
-        for p in paths:
-            try:
-                return self.call("GET", p)
-            except ApiError as e:
-                if e.status not in (400, 403, 404):
-                    raise
-                last = e
-        raise last
 
     # --- player ---
     def player(self):
@@ -374,28 +421,78 @@ class Spotify:
                 out.append(t)
         return out, j.get("total") or 0
 
+    def recent_items(self, max_age=120):
+        """Gli ultimi 50 ascolti: una sola lettura, riusata per max_age secondi."""
+        fetched, items = self._recent
+        if items is None or time.time() - fetched >= max_age:
+            items = (self.call("GET", "me/player/recently-played?limit=50") or {}).get("items", [])
+            self._recent = (time.time(), items)
+        return items
+
     def recent_map(self):
-        """URI -> ultimo ascolto (brani, album, playlist, artisti) dagli ultimi 50 ascolti; cache 2 min."""
-        if time.time() - getattr(self, "_rm_time", 0) < 120:
-            return self._rm
+        """URI -> ultimo ascolto (brani, album, playlist, artisti) dagli ultimi 50 ascolti."""
         m = {}
-        for x in (self.call("GET", "me/player/recently-played?limit=50") or {}).get("items", []):
+        for x in self.recent_items():
             ts, t = x.get("played_at") or "", x.get("track") or {}
             keys = [t.get("uri"), (t.get("album") or {}).get("uri"), (x.get("context") or {}).get("uri")]
             keys += [a.get("uri") for a in t.get("artists") or []]
             for k in keys:
                 if k and ts > m.get(k, ""):
                     m[k] = ts
-        self._rm, self._rm_time = m, time.time()
+        self.recent_by_uri = m
         return m
 
-    def recent(self):
-        out, seen = [], set()
-        for x in (self.call("GET", "me/player/recently-played?limit=50") or {}).get("items", []):
+    def recent_overview(self, max_age=15, max_colls=12):
+        """Scheda "Recenti": album e playlist da cui sono partiti gli ultimi 50 ascolti, poi i brani.
+
+        Ogni elemento ha "played", l'orario dell'ascolto più recente. Album e playlist vengono dal
+        contesto dell'ascolto, quindi compaiono anche se non sono salvati in libreria."""
+        items = self.recent_items(max_age=max_age)
+        colls, seen_c, tracks, seen_t = [], set(), [], set()
+        for x in items:
+            when = x.get("played_at") or ""
             t = parse_track(x.get("track"))
-            if t and t["uri"] not in seen:
-                seen.add(t["uri"]); out.append(t)
-        return out
+            if t and t["uri"] not in seen_t:
+                seen_t.add(t["uri"])
+                t["played"] = when
+                tracks.append(t)
+            ctx = x.get("context") or {}
+            kind, uri = ctx.get("type"), ctx.get("uri")
+            if kind not in ("album", "playlist") or not uri or uri in seen_c or len(colls) >= max_colls:
+                continue
+            seen_c.add(uri)
+            c = self._context_coll(kind, uri, items)
+            if c:
+                c["played"] = when
+                colls.append(c)
+        return {"colls": colls, "tracks": tracks}
+
+    def _context_coll(self, kind, uri, items):
+        """Scheda (nome, copertina…) dell'album o della playlist di un contesto."""
+        if kind == "album":
+            # di solito un brano ascoltato appartiene proprio a quell'album: nessuna richiesta
+            for x in items:
+                al = (x.get("track") or {}).get("album") or {}
+                if al.get("uri") == uri:
+                    return parse_coll(al, "album")
+        hit = self._ctx_cache.get(uri)
+        if hit and time.time() - hit[0] < CACHE_TTL:
+            return dict(hit[1])
+        cid = uri.rsplit(":", 1)[-1]
+        try:
+            if kind == "album":
+                j = self.call("GET", f"albums/{cid}")
+            else:
+                j = self.call("GET", f"playlists/{cid}?" + urllib.parse.urlencode(
+                    {"fields": "id,uri,name,images,owner(id,display_name)"}))
+        except ApiError as e:
+            if e.status == 429:
+                raise
+            return None  # playlist cancellata o non più accessibile: si salta
+        c = parse_coll(j, kind)
+        if c:
+            self._ctx_cache[uri] = (time.time(), c)
+        return dict(c) if c else None
 
     def all_items(self, page, max_pages=30):
         """Segue i link "next" della paginazione Spotify."""
@@ -409,16 +506,16 @@ class Spotify:
 
     def playlist_tracks(self, pid):
         try:
-            j = self.first_ok(f"playlists/{pid}/items?limit=100", f"playlists/{pid}/tracks?limit=100") or {}
+            j = self.call("GET", f"playlists/{pid}/items?limit=50") or {}
         except ApiError as e:
             if e.status == 403:
                 raise ApiError(403, None, "Spotify non permette di vedere i brani delle playlist di altri utenti. "
                                           "Puoi comunque riprodurla con il pulsante ▶ in alto.") from None
             raise
-        items = self.all_items(j)
+        items = self.all_items(j, max_pages=60)  # fino a 3050 brani
         tracks = []
         for x in items:
-            t = parse_track(x.get("item") or x.get("track"))
+            t = parse_track(x.get("item"))
             if t:
                 t["added"] = (lambda v: "" if not v or v.startswith("1970") else v)(x.get("added_at"))
                 tracks.append(t)
@@ -441,9 +538,7 @@ class Spotify:
 
     def artist(self, aid):
         """Album, singoli ed EP dell'artista, dal più recente."""
-        j = self.first_ok(f"artists/{aid}/albums?include_groups=album,single&limit=50",
-                          f"artists/{aid}/albums?include_groups=album,single&limit=10",
-                          f"artists/{aid}/albums") or {}
+        j = self.call("GET", f"artists/{aid}/albums?include_groups=album,single&limit=10") or {}
         out, seen = [], set()
         for x in self.all_items(j, max_pages=10):
             c = parse_coll(x, "album")
@@ -1178,6 +1273,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Desk Player")
         self.get_style_context().add_class("dp")
         self.set_default_size(1024, 600)
+        private_conf_dir()
         self.auth = Auth(self.on_login_changed)
         self.api = Spotify(self.auth)
         self.state = load_json(STATE_FILE)
@@ -1192,12 +1288,17 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.pending_seek = None
         self.pending_vol = None
         self.stack = [("library",)]
-        self.lib_tab = "playlist"
+        self.lib_tab = "recent"  # all'avvio si vedono gli ascolti recenti
         self.search_text = ""
         self.cache = {}
         self.token = 0
         self.track_labels = []
-        self.poll_count = 0
+        self.next_poll = 0
+        self.last_refresh = 0
+        self.last_activity = time.time()
+        self.iconified = False
+        self.server = None
+        self.rl_toast_until = 0
 
         self.overlay = Gtk.Overlay()
         self.add(self.overlay)
@@ -1214,7 +1315,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.views.add_named(self.np_full.root, "full")
         self.panels = [self.np_side, self.np_full]
 
-        self.start_server()
+        self.connect("window-state-event", self.on_window_state)
         self.touch_focus = TouchFocus(self)
         # partita bene: se era appena stata aggiornata, l'aggiornamento resta
         GLib.timeout_add_seconds(20, obc_update.confirm_started, NAME)
@@ -1296,14 +1397,24 @@ class DeskPlayer(Gtk.ApplicationWindow):
             return "<ip-scheda>"
 
     def start_server(self):
+        """Il server di login (solo 127.0.0.1) resta acceso finché non c'è un account collegato."""
+        if self.server:
+            return
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", PORT), make_handler(self.auth))
-            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.server = ThreadingHTTPServer(("127.0.0.1", PORT), make_handler(self.auth))
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
         except OSError as e:
             print("server di login non avviato:", e)
 
+    def stop_server(self):
+        srv, self.server = self.server, None
+        if srv:
+            # shutdown() aspetta il giro del server: fuori dal thread della UI
+            threading.Thread(target=lambda: (srv.shutdown(), srv.server_close()), daemon=True).start()
+
     def on_login_changed(self, logged):
         self.views.set_visible_child_name("main" if logged else "login")
+        (self.stop_server if logged else self.start_server)()
         if logged:
             self.cache.clear()
             self.render()
@@ -1332,6 +1443,11 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def on_error(self, e):
         if isinstance(e, NotLoggedIn):
             return False
+        if isinstance(e, ApiError) and e.status == 429:
+            # un solo avviso per ogni blocco, non uno a ogni tocco
+            if time.time() < self.rl_toast_until:
+                return False
+            self.rl_toast_until = self.api.blocked_until
         self.show_toast(str(e) or "Errore di rete")
         if isinstance(e, ApiError) and e.reason == "NO_ACTIVE_DEVICE":
             self.navigate_root(("devices",))
@@ -1343,12 +1459,14 @@ class DeskPlayer(Gtk.ApplicationWindow):
         GLib.timeout_add(3500, lambda: (getattr(self, "_toast_id", None) is tid and self.toast.hide()) and False)
 
     def act(self, fn, hold=1.2):
+        self.last_activity = time.time()
+
         def run():
             fn()
             return True
         def done(_):
             self.hold_until = time.time() + hold
-            GLib.timeout_add(int(hold * 1000), lambda: (setattr(self, "hold_until", 0), self.refresh_player()) and False)
+            GLib.timeout_add(int(hold * 1000), lambda: (setattr(self, "hold_until", 0), self.refresh_player(force=True)) and False)
             return False
         def fail(e):
             self.hold_until = 0
@@ -1360,16 +1478,37 @@ class DeskPlayer(Gtk.ApplicationWindow):
 
     # ---------------- player ----------------
 
+    def poll_interval(self):
+        """Secondi tra due letture del player: 2 in riproduzione, 5 in pausa, 15 dopo 10 minuti fermo."""
+        if self.player and self.player["playing"]:
+            return 2
+        return 15 if time.time() - self.last_activity > 600 else 5
+
     def poll_timer(self):
-        self.poll_count += 1
-        playing = bool(self.player and self.player["playing"])
-        if self.auth.logged_in and (self.poll_count % (2 if playing else 4) == 0) and self.get_visible():
+        now = time.time()
+        # niente letture da ridotta a icona o durante un blocco per rate limit
+        if (self.auth.logged_in and self.get_visible() and not self.iconified
+                and now >= self.next_poll and not self.api.rate_limited()):
             self.refresh_player()
         return True
 
-    def refresh_player(self):
+    def on_window_state(self, _win, event):
+        was = self.iconified
+        self.iconified = bool(event.new_window_state & Gdk.WindowState.ICONIFIED)
+        # di nuovo in primo piano: aggiorna subito, se non l'ha appena fatto do_activate
+        # (l'evento della finestra può arrivare anche un paio di secondi dopo)
+        if was and not self.iconified and time.time() - self.last_refresh > 3:
+            self.refresh_player()
+        return False
+
+    def refresh_player(self, force=False):
         if not self.auth.logged_in:
             return False
+        now = time.time()
+        if not force and now - self.last_refresh < 1:
+            return False  # due richieste ravvicinate (es. riapertura della finestra): ne basta una
+        # ogni lettura, anche quelle fuori dal timer, sposta in avanti la successiva
+        self.last_refresh, self.next_poll = now, now + self.poll_interval()
 
         def fetch():
             return self.api.player(), None
@@ -1380,6 +1519,8 @@ class DeskPlayer(Gtk.ApplicationWindow):
                 return False
             old_uri = self.player["track"]["uri"] if self.player and self.player["track"] else None
             self.player = p
+            if p and p["playing"]:
+                self.last_activity = time.time()
             if liked is not None:
                 self.liked = liked
             if p and p["device"] and p["device"]["id"] and p["device"]["id"] != self.state.get("last_device"):
@@ -1548,8 +1689,8 @@ class DeskPlayer(Gtk.ApplicationWindow):
     ALL_SORTS = ("added", "release", "recent", "alpha")
     # Ordinamenti che hanno senso per ogni pagina (l'API non dà date per playlist e artisti seguiti).
     # Il primo è quello usato se la scelta salvata non vale per la pagina.
-    PAGE_SORTS = {"playlist": ("added", "recent", "alpha"), "artist": ("alpha", "recent"),
-                  "releases": ("release", "recent", "alpha")}
+    PAGE_SORTS = {"playlist": ("added", "recent", "alpha"), "album": ("added", "release", "alpha"),
+                  "artist": ("alpha", "recent"), "releases": ("release", "recent", "alpha")}
 
     @property
     def sort_mode(self):
@@ -1680,7 +1821,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         if mode == "alpha":
             val = lambda x: x["name"].casefold()  # noqa: E731
         elif mode == "recent":
-            m = getattr(self.api, "_rm", {}) or {}
+            m = self.api.recent_by_uri
             val = lambda x: m.get(x.get("uri"), "")  # noqa: E731
         elif mode == "added":
             if not any(x.get("added") for x in items):
@@ -1779,8 +1920,9 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def load(self, container, cache_key, fn, build):
         """Mostra uno spinner, carica in background e costruisce il contenuto."""
         token = self.token
-        if cache_key and cache_key in self.cache:
-            build(container, self.cache[cache_key]); container.show_all()
+        hit = self.cache.get(cache_key) if cache_key else None
+        if hit and time.time() - hit[0] < CACHE_TTL:
+            build(container, hit[1]); container.show_all()
             return
         spin = Gtk.Spinner(); spin.start(); spin.set_size_request(48, 48)
         box = Gtk.Box(valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER, vexpand=True)
@@ -1791,7 +1933,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
             if token != self.token:
                 return False
             if cache_key:
-                self.cache[cache_key] = data
+                self.cache[cache_key] = (time.time(), data)
             container.remove(box)
             build(container, data)
             container.show_all()
@@ -1878,17 +2020,19 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def page_library(self):
         chips = Gtk.Box(spacing=8)
         chips.set_margin_start(14); chips.set_margin_top(6); chips.set_margin_bottom(4)
-        for key, text in (("playlist", "Playlist"), ("album", "Album"), ("artist", "Artisti")):
+        for key, text in (("recent", "Recenti"), ("album", "Album"), ("artist", "Artisti"), ("playlist", "Playlist")):
             b = Gtk.Button(label=text); b.get_style_context().add_class("chip")
             if key == self.lib_tab:
                 b.get_style_context().add_class("sel")
             b.connect("clicked", lambda _b, k=key: (setattr(self, "lib_tab", k), self.render()))
             chips.pack_start(b, False, False, 0)
-        for text, pg in (("Preferiti", ("liked",)), ("Recenti", ("recent",))):
-            b = Gtk.Button(label=text); b.get_style_context().add_class("chip")
-            b.connect("clicked", lambda _b, p=pg: self.open(p))
-            chips.pack_start(b, False, False, 0)
+        liked = Gtk.Button(label="Preferiti"); liked.get_style_context().add_class("chip")
+        liked.connect("clicked", lambda *_: self.open(("liked",)))
+        chips.pack_start(liked, False, False, 0)
         self.content.pack_start(chips, False, False, 0)
+        if self.lib_tab == "recent":
+            self.recent_tab()
+            return
         self.page_sorts = self.PAGE_SORTS.get(self.lib_tab, self.ALL_SORTS)
         self.toolbar(icon_button("view-refresh-symbolic", self.reload_library, tip="Aggiorna"))
         fn = {"playlist": self.api.playlists, "album": self.api.albums, "artist": self.api.artists}[self.lib_tab]
@@ -1899,6 +2043,32 @@ class DeskPlayer(Gtk.ApplicationWindow):
                 self.empty(lb, "Niente qui")
             self.add_colls(lb, self.sorted_items(colls))
         self.load(self.content, "lib:" + self.lib_tab, self.with_recent(fn), build)
+
+    def recent_tab(self):
+        """Album e playlist ascoltati di recente (anche non salvati), poi i brani, dal più recente."""
+        bar = Gtk.Box(spacing=8)
+        bar.set_margin_start(16); bar.set_margin_end(8); bar.set_margin_bottom(4)
+        bar.pack_start(label("Dagli ultimi 50 ascolti", "rsub"), False, False, 0)
+
+        def reload():
+            self.api._recent = (0, None)
+            self.render()
+        bar.pack_end(icon_button("view-refresh-symbolic", reload, tip="Aggiorna"), False, False, 0)
+        self.content.pack_start(bar, False, False, 0)
+
+        def build(container, data):
+            lb = self.scrolled_list(container)
+            if data["colls"]:
+                self.add_header(lb, "Album e playlist")
+                self.add_colls(lb, [dict(c, subtitle=" · ".join(v for v in (c["subtitle"], played_label(c["played"])) if v))
+                                    for c in data["colls"]])
+            tracks = data["tracks"]
+            if tracks:
+                self.add_header(lb, "Brani")
+                self.add_tracks(lb, tracks, lambda i: self.play_track(tracks[i]))
+            if not data["colls"] and not tracks:
+                self.empty(lb, "Nessun ascolto recente")
+        self.load(self.content, None, self.api.recent_overview, build)
 
     def reload_library(self):
         self.cache.pop("lib:" + self.lib_tab, None)
@@ -1998,20 +2168,6 @@ class DeskPlayer(Gtk.ApplicationWindow):
                              action=lambda d=d: self.transfer(d))
         self.load(self.content, None, self.api.devices, build)
 
-    def track_page(self, title, key, fn, liked=False, sortable=False):
-        self.back_header(title)
-        if sortable:
-            self.toolbar()
-
-        def build(container, tracks):
-            if sortable:
-                tracks = self.sorted_items(tracks)
-            lb = self.scrolled_list(container)
-            if not tracks:
-                self.empty(lb, "Niente qui")
-            self.add_tracks(lb, tracks, lambda i: self.play_track(tracks[i], liked=liked))
-        self.load(self.content, key, self.with_recent(fn) if sortable else fn, build)
-
     def page_liked(self):
         self.back_header("Brani che ti piacciono")
         self.toolbar()
@@ -2078,9 +2234,6 @@ class DeskPlayer(Gtk.ApplicationWindow):
             st["items"], st["total"] = res
             build_list()
         self.load(holder, None, first, built)
-
-    def page_recent(self):
-        self.track_page("Ascoltati di recente", "recent", self.api.recent)
 
     def page_detail(self, c):
         sub = self.back_header(c["name"], c["subtitle"], c["image"] or "", play=lambda: self.play_context(c["uri"]))
@@ -2200,6 +2353,10 @@ class App(Gtk.Application):
             self.win.show_main()
             self.win.open(("detail", {"kind": kind, "id": cid, "uri": f"spotify:{kind}:{cid}",
                                       "name": kind.capitalize(), "subtitle": "", "image": None}))
+        elif name == "recent":
+            self.win.show_main()
+            self.win.lib_tab = "recent"
+            self.win.navigate_root(("library",))
         else:
             self.win.show_main()
             self.win.navigate_root((name,))

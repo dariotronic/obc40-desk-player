@@ -11,7 +11,7 @@ The board has no audio output: the music plays on another Spotify device (PC, ph
 ## Features
 
 - **Now playing**: cover, title, artist (tap the artist to open their page), seek bar, play/pause, previous/next, shuffle, repeat, volume and current device. A ⛶ button opens a fullscreen view.
-- **Library**: playlists, albums, followed artists, liked songs (loaded 100 at a time, then 50 more each time you reach the bottom) and recently played.
+- **Library**: opens on **Recenti** (recently played): the albums and playlists you played, even if they are not saved, with the time of the last play, then the tracks. Then saved albums, followed artists, playlists and liked songs (loaded 100 at a time, then 50 more each time you reach the bottom).
 - **Search** for tracks, artists, albums and your own playlists.
 - **Queue**, with add (+) and remove (−).
 - **Devices**: move playback to another device.
@@ -98,9 +98,10 @@ These come from the Spotify Web API or the platform. They are not bugs to fix.
 | What | How Desk Player handles it |
 |---|---|
 | Playing a list of `uris` returns 204 but nothing plays, at least on the desktop client | Every track starts inside a **context** with an offset: its album, or your Liked Songs collection |
-| Tracks of playlists owned by **other users** return 403, even if you follow them | Search only shows your own playlists. Opening someone else's playlist shows a message; ▶ still tries to play it |
-| Saving or removing liked songs (`PUT/DELETE me/tracks`) returns 403 | No "like" button |
+| Tracks of playlists owned by **other users** return 403, even if you follow them: the API only serves playlists you own or collaborate on | Search only shows your own playlists. Opening someone else's playlist shows a message; ▶ still tries to play it |
+| Saving or removing liked songs with `PUT/DELETE me/tracks` returns 403, and those endpoints are now deprecated | No "like" button yet |
 | The API cannot remove tracks from the queue | A removed track is hidden and skipped when it starts, as long as the app is running |
+| Spotify limits how many requests an app can make (HTTP 429) | Desk Player waits as long as Spotify asks (`Retry-After`), checks the player less often when nothing plays, and not at all while minimised |
 | "Recently played" only covers the last 50 plays | Items without data go to the bottom |
 | Followed playlists and artists have no dates | Those pages offer no date-based sorting |
 | On the 4.14 kernel, recent musl and GLib use `faccessat2` (kernel 5.8 or newer), so GLib file checks always fail | The wrapper preloads [`faccessat-fix`](faccessat-fix/) |
@@ -123,6 +124,7 @@ The code is plain Python 3 + GTK 3 with no build step.
 | `obc_update.py` | the in-app updater (GitHub Releases) |
 | `login-tunnel.py` | runs on the PC |
 | `dev/` | test helpers to run on the board |
+| `docs/spotify-api.md` | rules for working with the Spotify Web API: read it before changing API calls |
 
 The `dev/` helpers:
 - `env.sh` attaches an SSH shell to the graphical session.
