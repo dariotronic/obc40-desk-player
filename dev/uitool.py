@@ -1,6 +1,7 @@
 """Strumento di test per il display: tocchi simulati (XTest) e screenshot.
 
 uso: python3 uitool.py tap X Y [X Y ...]   (pausa di 0,6 s tra un tocco e l'altro)
+     python3 uitool.py hold X Y               (tocco prolungato, 1 s)
      python3 uitool.py shot /tmp/s.jpg [larghezza]
 Va lanciato con DISPLAY/XAUTHORITY della sessione (. dev/env.sh).
 """
@@ -9,7 +10,7 @@ import sys
 import time
 
 
-def tap(points):
+def tap(points, press=0.08):
     x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
     xt = ctypes.cdll.LoadLibrary("libXtst.so.6")
     x11.XOpenDisplay.restype = ctypes.c_void_p
@@ -21,7 +22,7 @@ def tap(points):
         xt.XTestFakeMotionEvent(d, -1, int(x), int(y), 0)
         xt.XTestFakeButtonEvent(d, 1, 1, 0)
         x11.XFlush(d)
-        time.sleep(0.08)
+        time.sleep(press)
         xt.XTestFakeButtonEvent(d, 1, 0, 0)
         x11.XFlush(d)
         time.sleep(0.6)
@@ -45,5 +46,7 @@ if __name__ == "__main__":
     if sys.argv[1] == "tap":
         v = list(map(int, sys.argv[2:]))
         tap(list(zip(v[::2], v[1::2])))
+    elif sys.argv[1] == "hold":
+        tap([(int(sys.argv[2]), int(sys.argv[3]))], press=1.0)
     elif sys.argv[1] == "shot":
         shot(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)

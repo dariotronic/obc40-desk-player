@@ -43,6 +43,8 @@ WRAPPER = os.path.expanduser("~/.local/bin/desk-player")
 CONF_DIR = os.path.expanduser("~/.config/desk-player")
 AUTH_FILE = os.path.join(CONF_DIR, "auth.json")
 STATE_FILE = os.path.join(CONF_DIR, "state.json")
+HISTORY_FILE = os.path.join(CONF_DIR, "history.json")
+LIKED_NAME = "Brani che ti piacciono"
 PORT = 8888
 REDIRECT_URI = f"http://127.0.0.1:{PORT}/callback"
 SCOPES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
@@ -231,6 +233,7 @@ def parse_coll(j, kind):
     big, small = img_urls(j)
     if kind == "playlist":
         sub = (j.get("owner") or {}).get("display_name") or ""
+        owner = (j.get("owner") or {}).get("id") or ""
     elif kind == "album":
         sub = ", ".join(a.get("name", "") for a in j.get("artists") or [])
     else:
@@ -240,6 +243,8 @@ def parse_coll(j, kind):
     if kind == "album":
         c["date"] = j.get("release_date") or ""
         c["type"] = release_type(j)
+    if kind == "playlist":
+        c["owner"] = owner
     return c
 
 
@@ -421,7 +426,15 @@ class Spotify:
     # --- libreria ---
     def playlists(self):
         items = self.all_items(self.call("GET", "me/playlists?limit=50"), max_pages=10)
-        return [c for c in (parse_coll(x, "playlist") for x in items) if c]
+        out = [c for c in (parse_coll(x, "playlist") for x in items) if c]
+        try:
+            me = self.me_id()
+        except ApiError:
+            me = None
+        for c in out:
+            c["group"] = ("mine" if me and c.get("owner") == me else
+                          "spotify" if c.get("owner") == "spotify" else "followed")
+        return out
 
     def albums(self):
         out = []
@@ -532,6 +545,8 @@ class Spotify:
         try:
             if kind == "album":
                 j = self.call("GET", f"albums/{cid}")
+            elif kind == "artist":
+                j = self.call("GET", f"artists/{cid}")
             else:
                 j = self.call("GET", f"playlists/{cid}?" + urllib.parse.urlencode(
                     {"fields": "id,uri,name,images,owner(id,display_name)"}))
@@ -543,6 +558,12 @@ class Spotify:
         if c:
             self._ctx_cache[uri] = (time.time(), c)
         return dict(c) if c else None
+
+    def context_meta(self, kind, uri):
+        """Nome e copertina di un contesto per lo storico."""
+        if kind == "liked":
+            return {"name": LIKED_NAME, "subtitle": "Playlist", "image": None, "medium": None}
+        return self._context_coll(kind, uri, [])
 
     def all_items(self, page, max_pages=30):
         """Segue i link "next" della paginazione Spotify."""
@@ -639,6 +660,205 @@ class Spotify:
 # Server di login (127.0.0.1:8888)
 # ======================================================================
 
+def iso_time(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
+
+
+def parse_iso(s):
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+class History:
+    """Storico degli ascolti tenuto dal Desk Player sulla scheda (history.json, non esce dalla scheda).
+
+    Spotify dà solo gli ultimi 50 brani ascoltati: qui si ricordano album, playlist, artisti e Brani
+    che ti piacciono da cui è partita la musica, con quando e per quanto li si è ascoltati. Si aggiorna
+    leggendo il player finché il Desk Player è aperto e unendo gli ultimi 50 ascolti di Spotify, che
+    coprono ciò che si è ascoltato a Desk Player chiuso o ridotto a icona.
+
+    Elemento: {"uri", "kind", "id", "name", "subtitle", "image", "medium", "last" (istante),
+    "plays" ([istante, id del brano], gli ultimi MAX_PLAYS), "days" ({"AAAA-MM-GG": secondi})}."""
+
+    MAX_ITEMS = 500
+    MAX_PLAYS = 40
+    DAYS = 30
+    HALF_LIFE = 7 * 86400   # un ascolto di una settimana fa vale metà di uno di oggi
+    MIN_PLAY = 30           # secondi perché un brano conti come ascolto (come per Spotify)
+
+    def __init__(self, path=HISTORY_FILE):
+        self.path = path
+        self.lock = threading.Lock()
+        d = load_json(path)
+        self.items = d.get("items") or {} if isinstance(d, dict) else {}
+        self.cur = None        # brano in corso: {"track", "key", "secs", "counted"}
+        self.last_tick = None
+        self.dirty = False
+        self.saved_at = time.time()
+
+    @staticmethod
+    def key_of(ctx, t):
+        """Elemento dello storico per un ascolto: il contesto (album, playlist, artista, Brani che ti
+        piacciono) o, se manca (brano partito dalla ricerca o dalla coda), l'album del brano."""
+        if ctx:
+            parts = ctx.split(":")
+            if len(parts) == 3 and parts[1] in ("album", "playlist", "artist"):
+                return ctx, parts[1]
+            if ctx.endswith(":collection"):
+                return ctx, "liked"
+        if t and t.get("album_uri"):
+            return t["album_uri"], "album"
+        return None, None
+
+    def needs_meta(self, key):
+        with self.lock:
+            return not (self.items.get(key) or {}).get("name")
+
+    def _entry(self, key, kind):
+        e = self.items.get(key)
+        if e is None:
+            e = self.items[key] = {"uri": key, "kind": kind, "id": key.rsplit(":", 1)[-1],
+                                   "last": 0, "plays": [], "days": {}}
+        return e
+
+    @staticmethod
+    def _meta(e, m):
+        for k in ("name", "subtitle", "image", "medium"):
+            if m.get(k) is not None or k not in e:
+                e[k] = m.get(k)
+
+    @staticmethod
+    def _album_meta(e, t):
+        if not e.get("name") and e["kind"] == "album" and t.get("album_uri") == e["uri"]:
+            History._meta(e, {"name": t["album"], "subtitle": t["artists"], "image": t["small"],
+                              "medium": t.get("medium")})
+
+    def observe(self, p, meta=None):
+        """Lettura del player (ogni pochi secondi): tempo di ascolto e, dopo 30 s, un ascolto."""
+        now = time.time()
+        with self.lock:
+            last, self.last_tick = self.last_tick, now
+            t = p["track"] if p else None
+            if not p or not p["playing"] or not t or not t["uri"].startswith("spotify:track:"):
+                self.cur = None
+                self._maybe_save(now)
+                return
+            key, kind = self.key_of(p.get("context"), t)
+            if not key:
+                return
+            e = self._entry(key, kind)
+            if meta:
+                self._meta(e, meta)
+            self._album_meta(e, t)
+            tid = t["uri"].rsplit(":", 1)[-1]
+            if not self.cur or self.cur["track"] != tid or self.cur["key"] != key:
+                self.cur = {"track": tid, "key": key, "secs": 0.0, "counted": False}
+            elif last:
+                dt = min(now - last, 20)  # dopo una pausa nelle letture si conta al massimo un intervallo
+                self.cur["secs"] += dt
+                day = time.strftime("%Y-%m-%d")
+                e["days"][day] = round(e["days"].get(day, 0) + dt, 1)
+            e["last"] = now
+            self.dirty = True
+            counted = False
+            if not self.cur["counted"] and self.cur["secs"] >= self.MIN_PLAY:
+                self.cur["counted"] = counted = True
+                e["plays"].append([round(now), tid])
+                del e["plays"][:-self.MAX_PLAYS]
+            self._maybe_save(now, force=counted)
+
+    def merge_api(self, items, resolve):
+        """Unisce gli ultimi 50 ascolti di Spotify. resolve(kind, uri) dà nome e copertina dei contesti
+        nuovi (una richiesta per playlist o artista, solo la prima volta)."""
+        todo = []
+        with self.lock:
+            for x in items:
+                ts = parse_iso(x.get("played_at") or "")
+                t = parse_track(x.get("track"))
+                if not ts or not t or not t["uri"].startswith("spotify:track:"):
+                    continue
+                key, kind = self.key_of((x.get("context") or {}).get("uri"), t)
+                if not key:
+                    continue
+                e = self._entry(key, kind)
+                self._album_meta(e, t)
+                tid = t["uri"].rsplit(":", 1)[-1]
+                dur = (t["duration"] or 0) / 1000
+                # già contato: letto dal player mentre suonava, o in un'unione precedente
+                if any(pt == tid and ts - dur - 120 <= pts <= ts + 120 for pts, pt in e["plays"]):
+                    continue
+                e["plays"].append([round(ts), tid])
+                e["plays"].sort()
+                del e["plays"][:-self.MAX_PLAYS]
+                day = time.strftime("%Y-%m-%d", time.localtime(ts))
+                e["days"][day] = round(e["days"].get(day, 0) + dur, 1)
+                e["last"] = max(e["last"], ts)
+                self.dirty = True
+                if not e.get("name"):
+                    todo.append((kind, key))
+        for kind, key in dict.fromkeys(todo):
+            try:
+                m = resolve(kind, key)
+            except ApiError:
+                break  # troppe richieste: si riprova al prossimo aggiornamento
+            if m:
+                with self.lock:
+                    self._meta(self.items[key], m)
+        with self.lock:
+            self._maybe_save(time.time(), force=True)
+
+    def _maybe_save(self, now, force=False):
+        if not self.dirty or (not force and now - self.saved_at < 60):
+            return
+        cutoff = time.strftime("%Y-%m-%d", time.localtime(now - self.DAYS * 86400))
+        for e in self.items.values():
+            e["days"] = {d: v for d, v in e["days"].items() if d >= cutoff}
+        if len(self.items) > self.MAX_ITEMS:
+            keep = sorted(self.items.values(), key=lambda e: e["last"], reverse=True)[:self.MAX_ITEMS]
+            self.items = {e["uri"]: e for e in keep}
+        try:
+            save_json(self.path, {"version": 1, "items": self.items})
+            self.dirty, self.saved_at = False, now
+        except OSError:
+            pass
+
+    def flush(self):
+        with self.lock:
+            self._maybe_save(time.time(), force=True)
+
+    # --- viste ---
+    @staticmethod
+    def _coll(e, **extra):
+        return dict({"kind": e["kind"], "id": e["id"], "uri": e["uri"], "name": e["name"],
+                     "subtitle": e.get("subtitle") or "", "image": e.get("image"), "medium": e.get("medium"),
+                     "played": iso_time(e["last"])}, **extra)
+
+    def _named(self):
+        return [e for e in self.items.values() if e.get("name")]
+
+    def shortcuts(self, n=8):
+        """Ciò che si ascolta di più in questo periodo: ascolti pesati da quanto sono recenti."""
+        now = time.time()
+        with self.lock:
+            def score(e):
+                return (sum(0.5 ** ((now - ts) / self.HALF_LIFE) for ts, _ in e["plays"]), e["last"])
+            return [self._coll(e) for e in sorted(self._named(), key=score, reverse=True)[:n]]
+
+    def recent(self, n=30):
+        with self.lock:
+            return [self._coll(e) for e in sorted(self._named(), key=lambda e: e["last"], reverse=True)[:n]]
+
+    def top(self, n=8):
+        """I più ascoltati negli ultimi DAYS giorni, per tempo di ascolto."""
+        with self.lock:
+            tot = [(sum(e["days"].values()), e) for e in self._named()]
+            tot = [x for x in tot if x[0] >= 60]
+            tot.sort(key=lambda x: x[0], reverse=True)
+            return [self._coll(e, secs=secs) for secs, e in tot[:n]]
+
+
 def page(title, body):
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.5}}
@@ -729,6 +949,11 @@ list row:active { background-color: #23262d; }
 .rtitle.cur { color: @accent; }
 .rsub { font-size: 12px; color: #9aa0aa; }
 .card { background-color: #1b1d23; border-radius: 12px; padding: 8px; }
+.tile { background-color: #23262d; border-radius: 6px; }
+flowboxchild:active .tile { background-color: #2c3038; }
+.tiletitle { font-size: 14px; font-weight: bold; color: #ffffff; }
+.tiletitle.cur { color: @accent; }
+list row.plain, list row.plain:hover { background-color: transparent; padding: 6px 12px 10px 12px; }
 flowboxchild { padding: 0; }
 flowboxchild:active .card { background-color: #23262d; }
 button.cardbtn { background: none; border: none; box-shadow: none; color: #9aa0aa;
@@ -1067,6 +1292,26 @@ def fmt(ms):
     return f"{s // 60}:{s % 60:02d}"
 
 
+def on_hold(container, child_at):
+    """Tocco prolungato sugli elementi di `container` (ListBox o FlowBox): chiama il `_hold_cb`
+    dell'elemento toccato e annulla il tocco normale che segue al rilascio. Il gesto sta sul
+    contenitore perché in GTK 3 righe e schede non hanno una finestra propria e non ricevono eventi."""
+    g = Gtk.GestureLongPress.new(container)
+
+    def pressed(_g, x, y):
+        ch = child_at(int(x), int(y))
+        cb = getattr(ch, "_hold_cb", None) if ch else None
+        if cb:
+            ch._held = time.time()
+            cb()
+    g.connect("pressed", pressed)
+    container._hold_gesture = g  # il gesto vive quanto il contenitore
+
+
+def just_held(widget):
+    return time.time() - getattr(widget, "_held", 0) < 1.5
+
+
 class ListView:
     """Elenco a righe (Gtk.ListBox)."""
 
@@ -1076,7 +1321,9 @@ class ListView:
         self.sw = sw
         self.lb = Gtk.ListBox()
         self.lb.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.lb.connect("row-activated", lambda _lb, row: getattr(row, "action", None) and row.action())
+        self.lb.connect("row-activated", lambda _lb, row: getattr(row, "action", None)
+                        and not just_held(row) and row.action())
+        on_hold(self.lb, lambda _x, y: self.lb.get_row_at_y(y))
         sw.add(self.lb)
         container.pack_start(sw, True, True, 0)
 
@@ -1090,9 +1337,16 @@ class ListView:
         row.add(label(text, "text", ellipsize=False, wrap=True))
         self.lb.add(row)
 
+    def widget(self, w):
+        row = Gtk.ListBoxRow(activatable=False, selectable=False)
+        row.get_style_context().add_class("plain")
+        row.add(w)
+        self.lb.add(row)
+
     def item(self, title, subtitle, image=None, round_img=False, action=None, buttons=(), extra=None,
-             number=None, current=False, icon=None):
+             number=None, current=False, icon=None, hold=None):
         row = Gtk.ListBoxRow()
+        row._hold_cb = hold
         box = Gtk.Box(spacing=12)
         if number is not None:
             n = label(str(number), "rsub", 1.0, ellipsize=False)
@@ -1156,7 +1410,9 @@ class CardView:
             f.set_column_spacing(10)
             f.set_row_spacing(10)
             f.set_valign(Gtk.Align.START)
-            f.connect("child-activated", lambda _f, ch: getattr(ch, "action", None) and ch.action())
+            f.connect("child-activated", lambda _f, ch: getattr(ch, "action", None)
+                      and not just_held(ch) and ch.action())
+            on_hold(f, f.get_child_at_pos)
             self.box.pack_start(f, False, False, 4)
             self.flow = f
         return self.flow
@@ -1169,9 +1425,14 @@ class CardView:
         self.flow = None
         self.box.pack_start(label(text, "text", ellipsize=False, wrap=True), False, False, 12)
 
+    def widget(self, w):
+        self.flow = None
+        self.box.pack_start(w, False, False, 4)
+
     def item(self, title, subtitle, image=None, round_img=False, action=None, buttons=(), extra=None,
-             number=None, current=False, icon=None):
+             number=None, current=False, icon=None, hold=None):
         ch = Gtk.FlowBoxChild()
+        ch._hold_cb = hold
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         card.get_style_context().add_class("card")
         ov = Gtk.Overlay()
@@ -1382,20 +1643,37 @@ class NowPlayingView:
 
 class TouchFocus:
     """Col touch il focus resta sui pulsanti toccati (bordo tratteggiato): lo si toglie subito,
-    tranne che dai campi di testo. Quando la tastiera a schermo si chiude, si toglie anche da quelli."""
+    tranne che dai campi di testo. Quando la tastiera a schermo si chiude, si toglie anche da quelli.
+
+    La tastiera a schermo (onboard) la si apre e chiude da qui, via D-Bus: l'apertura automatica di
+    onboard dipende dagli eventi di accessibilità (AT-SPI) e a volte smette di funzionare finché
+    non si riavvia onboard."""
+
+    KB = ("org.onboard.Onboard", "/org/onboard/Onboard/Keyboard", "org.onboard.Onboard.Keyboard")
 
     def __init__(self, win):
         self.win = win
+        self.bus = None
+        self.kb_shown = False
         win.connect("set-focus", self.on_set_focus)
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self.bus = bus
             bus.signal_subscribe("org.onboard.Onboard", "org.freedesktop.DBus.Properties", "PropertiesChanged",
                                  "/org/onboard/Onboard/Keyboard", None, Gio.DBusSignalFlags.NONE,
                                  self.on_keyboard, None)
         except GLib.Error:
             pass
 
+    def keyboard(self, show):
+        if not self.bus or show == self.kb_shown:
+            return
+        self.kb_shown = show
+        self.bus.call(*self.KB, "Show" if show else "Hide", None, None, Gio.DBusCallFlags.NONE, 1000,
+                      None, None, None)  # senza onboard la chiamata fallisce in silenzio
+
     def on_set_focus(self, _win, widget):
+        self.keyboard(isinstance(widget, Gtk.Entry))
         if widget is not None and not isinstance(widget, Gtk.Entry):
             GLib.idle_add(self.drop, False)
 
@@ -1408,6 +1686,7 @@ class TouchFocus:
     def on_keyboard(self, _conn, _sender, _path, _iface, _signal, params, _data):
         changed = params.unpack()[1]
         if changed.get("Visible") is False:
+            self.kb_shown = False
             GLib.idle_add(self.drop, True)
 
 
@@ -1419,6 +1698,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         private_conf_dir()
         self.auth = Auth(self.on_login_changed)
         self.api = Spotify(self.auth)
+        self.history = History()
         self.state = load_json(STATE_FILE)
         self.accent = Accent()
         self.skip_uris = []
@@ -1438,6 +1718,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.cache = {}
         self.token = 0
         self.track_labels = []
+        self.page_cache_keys = []
         self.next_poll = 0
         self.last_refresh = 0
         self.last_activity = time.time()
@@ -1509,10 +1790,9 @@ class DeskPlayer(Gtk.ApplicationWindow):
             b.connect("clicked", lambda _b, k=key: self.navigate_root((k,)))
             nav.pack_start(b, False, False, 0)
             self.nav_buttons[key] = b
-        nav.pack_end(icon_button("go-home-symbolic", self.go_home, tip="Home"), False, False, 0)
-        self.b_view = icon_button("view-grid-symbolic", self.toggle_view, tip="Elenco / schede")
-        nav.pack_end(self.b_view, False, False, 0)
-        self.update_view_icon()
+        nav.pack_end(icon_button("dp-home-symbolic", self.go_home, tip="Home"), False, False, 0)
+        nav.pack_end(icon_button("emblem-system-symbolic", self.settings_dialog, tip="Impostazioni"), False, False, 0)
+        nav.pack_end(icon_button("view-refresh-symbolic", self.refresh_page, tip="Aggiorna"), False, False, 0)
         right.pack_start(nav, False, False, 0)
         self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         right.pack_start(self.content, True, True, 0)
@@ -1668,10 +1948,19 @@ class DeskPlayer(Gtk.ApplicationWindow):
                     liked = self.api.in_library([uri]).get(uri)
                 except ApiError:
                     pass
-            return p, (uri, liked)
+            meta = None
+            if p and p["playing"] and p["track"]:
+                key, kind = History.key_of(p.get("context"), p["track"])
+                if key and (kind != "album" or key != p["track"].get("album_uri")) and self.history.needs_meta(key):
+                    try:
+                        meta = self.api.context_meta(kind, key)
+                    except ApiError:
+                        pass
+            return p, (uri, liked), meta
 
         def done(res):
-            p, (uri, liked) = res
+            p, (uri, liked), meta = res
+            self.history.observe(p, meta)
             if liked is not None:
                 self.saved[uri] = liked
             if time.time() < self.hold_until:
@@ -1682,7 +1971,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
             # cambiato l'album o la playlist in riproduzione: la scheda Recenti lo mette in cima
             if (p and p["track"] and p.get("context") != old_ctx and old_ctx is not None
                     and self.stack == [("library",)] and self.lib_tab == "recent"
-                    and not getattr(self, "_sort_modal", None)):
+                    and not getattr(self, "_modal", None)):
                 GLib.idle_add(lambda: self.render() and False)
             if p and p["playing"]:
                 self.last_activity = time.time()
@@ -1831,7 +2120,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         if self.scope_warned or not self.auth.missing_scopes():
             return
         self.scope_warned = True
-        self.show_toast("Per alcune funzioni serve un nuovo accesso: Dispositivi → Esci dall'account, poi ricollegati")
+        self.show_toast("Per alcune funzioni serve un nuovo accesso: Impostazioni (⚙) → Esci dall'account, poi ricollegati")
 
     def toggle_like(self):
         t = self.player["track"] if self.player else None
@@ -1942,53 +2231,36 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def arrow_icon(desc):
         return "go-down-symbolic" if desc else "go-up-symbolic"
 
-    def sort_button(self):
-        b = Gtk.Button()
-        hb = Gtk.Box(spacing=6)
-        im = Gtk.Image.new_from_icon_name(self.arrow_icon(self.sort_desc), Gtk.IconSize.BUTTON)
-        im.set_pixel_size(16)
-        hb.pack_start(Gtk.Label(label=f"Ordina: {dict(self.SORTS)[self.sort_mode]}"), False, False, 0)
-        hb.pack_start(im, False, False, 0)
-        b.add(hb)
-        b.get_style_context().add_class("chip")
-        b.set_valign(Gtk.Align.CENTER)
-        b.connect("clicked", lambda *_: self.sort_dialog())
+    def filter_button(self, playlists=False):
+        """Pulsante dei filtri: apre la finestra con ordinamento (e, per le playlist, filtro e cartelle).
+        È colorato quando un filtro nasconde qualcosa."""
+        b = icon_button("dp-filter-symbolic", lambda: self.sort_dialog(playlists), size=20, tip="Ordina e filtra")
+        b.set_valign(Gtk.Align.CENTER)  # non allunga i chip accanto
+        self.set_on(b, playlists and self.pl_filter != "all")
         return b
 
-    def sort_dialog(self):
-        """Finestra modale (dentro l'app) per scegliere ordinamento e direzione."""
-        if getattr(self, "_sort_modal", None):
-            return
-        shade = Gtk.EventBox()
-        shade.get_style_context().add_class("shade")
-        card_ev = Gtk.EventBox(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-        card_ev.connect("button-release-event", lambda *_: True)  # i tocchi sulla scheda non la chiudono
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        card.get_style_context().add_class("sortcard")
-        card.set_size_request(380, -1)
-        card_ev.add(card)
-        shade.add(card_ev)
-
-        pending = {"mode": self.sort_mode, "desc": self.sort_desc}
-
-        def close(*_):  # tocco fuori: annulla
-            shade.destroy()
-            self._sort_modal = None
-            return True
-        shade.connect("button-release-event", close)
+    def sort_dialog(self, playlists=False):
+        """Finestra modale (dentro l'app) per scegliere ordinamento e direzione e, per le playlist,
+        quali mostrare."""
+        card, close, shade = self.modal("Ordina per")  # tocco fuori: annulla
+        pending = {"mode": self.sort_mode, "desc": self.sort_desc, "filter": self.pl_filter}
 
         def apply(*_):
             close()
-            if (pending["mode"], pending["desc"]) == (self.sort_mode, self.sort_desc):
+            if (pending["mode"], pending["desc"], pending["filter"]) == (self.sort_mode, self.sort_desc,
+                                                                         self.pl_filter):
                 return
-            self.state["sort"], self.state["sort_desc"] = pending["mode"], pending["desc"]
+            if (pending["mode"], pending["desc"]) != (self.sort_mode, self.sort_desc):
+                # l'ordinamento vale per tutte le pagine: lo si salva solo se è cambiato davvero
+                self.state["sort"], self.state["sort_desc"] = pending["mode"], pending["desc"]
+            if playlists:
+                self.state["pl_filter"] = pending["filter"]
             save_json(STATE_FILE, self.state)
             if self.sort_mode == "recent":
                 self.bg(self.api.recent_map, lambda _r: self.render() and False)
             else:
                 self.render()
 
-        card.pack_start(label("Ordina per", "dtitle"), False, False, 4)
         rows = {}
 
         def refresh():
@@ -2022,26 +2294,37 @@ class DeskPlayer(Gtk.ApplicationWindow):
             btn.connect("clicked", lambda _b, k=key: choose(k))
             card.pack_start(btn, False, False, 0)
             rows[key] = (btn, img)
-        card.pack_start(label("Tocca di nuovo la voce scelta per invertire la freccia", "rsub",
-                              ellipsize=False, wrap=True), False, False, 4)
+        hint = label("Tocca di nuovo la voce scelta per invertire la freccia", "rsub", ellipsize=False, wrap=True)
+        hint.set_max_width_chars(54)
+        card.pack_start(hint, False, False, 4)
+        if playlists:
+            card.pack_start(label("Mostra", "dtitle"), False, False, 4)
+            fbox = Gtk.Box(spacing=8)
+            fbtns = {}
+
+            def pick(k):
+                pending["filter"] = k
+                for key, b in fbtns.items():
+                    (b.get_style_context().add_class if key == k else b.get_style_context().remove_class)("sel")
+            for key, name in self.PL_FILTERS:
+                b = Gtk.Button(label=name)
+                b.get_style_context().add_class("chip")
+                b.connect("clicked", lambda _b, k=key: pick(k))
+                fbox.pack_start(b, False, False, 0)
+                fbtns[key] = b
+            pick(pending["filter"])
+            card.pack_start(fbox, False, False, 0)
+            tip = label("Cartelle: tocca a lungo una playlist per metterla in una cartella, "
+                        "o una cartella per rinominarla o eliminarla", "rsub", ellipsize=False, wrap=True)
+            tip.set_max_width_chars(54)
+            card.pack_start(tip, False, False, 8)
         done = Gtk.Button(label="Fatto")
         done.get_style_context().add_class("chip")
         done.get_style_context().add_class("sel")
         done.connect("clicked", apply)
         card.pack_start(done, False, False, 6)
-        self.overlay.add_overlay(shade)
         shade.show_all()
         refresh()
-        self._sort_modal = shade
-
-    def toolbar(self, *right):
-        """Riga con il pulsante di ordinamento a sinistra ed eventuali pulsanti a destra."""
-        bar = Gtk.Box(spacing=8)
-        bar.set_margin_start(14); bar.set_margin_end(8); bar.set_margin_bottom(4)
-        bar.pack_start(self.sort_button(), False, False, 0)
-        for w in right:
-            bar.pack_end(w, False, False, 0)
-        self.content.pack_start(bar, False, False, 0)
 
     def sorted_items(self, items):
         """Ordina secondo la scelta dell'utente; gli elementi senza dato finiscono sempre in fondo.
@@ -2106,18 +2389,73 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def cards(self):
         return self.state.get("view") == "cards"
 
-    def toggle_view(self):
-        self.state["view"] = "list" if self.cards else "cards"
+    def set_view(self, cards):
+        if cards == self.cards:
+            return
+        self.state["view"] = "cards" if cards else "list"
         save_json(STATE_FILE, self.state)
-        self.update_view_icon()
         self.render()
 
-    def update_view_icon(self):
-        # l'icona mostra la modalità in cui si passa toccandola
-        theme = Gtk.IconTheme.get_default()
-        names = (["view-list-symbolic", "view-list-bullet-symbolic"] if self.cards
-                 else ["view-grid-symbolic", "view-app-grid-symbolic"])
-        self.set_icon(self.b_view, next((n for n in names if theme.has_icon(n)), names[0]))
+    def settings_dialog(self):
+        """Impostazioni: vista elenco/schede, versione e aggiornamenti."""
+        card, close, shade = self.modal("Impostazioni")
+        card.pack_start(label("Visualizzazione", "hdr"), False, False, 4)
+        row = Gtk.Box(spacing=8)
+        btns = {}
+
+        def pick(cards):
+            for k, b in btns.items():
+                (b.get_style_context().add_class if k == cards else b.get_style_context().remove_class)("sel")
+            self.set_view(cards)
+        for cards, text, icons in ((False, "Elenco", ("view-list-symbolic", "view-list-bullet-symbolic")),
+                                   (True, "Schede", ("view-grid-symbolic", "view-app-grid-symbolic"))):
+            b = Gtk.Button()
+            hb = Gtk.Box(spacing=8)
+            theme = Gtk.IconTheme.get_default()
+            im = Gtk.Image.new_from_icon_name(next((n for n in icons if theme.has_icon(n)), icons[0]),
+                                              Gtk.IconSize.BUTTON)
+            im.set_pixel_size(18)
+            hb.pack_start(im, False, False, 0)
+            hb.pack_start(Gtk.Label(label=text), False, False, 0)
+            b.add(hb)
+            b.get_style_context().add_class("chip")
+            b.connect("clicked", lambda _b, c=cards: pick(c))
+            row.pack_start(b, False, False, 0)
+            btns[cards] = b
+        for k, b in btns.items():
+            (b.get_style_context().add_class if k == self.cards else b.get_style_context().remove_class)("sel")
+        card.pack_start(row, False, False, 0)
+
+        card.pack_start(label("Aggiornamenti", "hdr"), False, False, 8)
+        upd_row = Gtk.Box(spacing=10)
+        upd_row.pack_start(label(f"Desk Player {obc_update.read_version(APP_DIR)}", "text", ellipsize=False),
+                           False, False, 0)
+        upd = Gtk.Button()
+        ub = Gtk.Box(spacing=6)
+        ui = Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        ui.set_pixel_size(16)
+        ub.pack_start(Gtk.Label(label="Controlla aggiornamenti"), False, False, 0)
+        ub.pack_start(ui, False, False, 0)
+        upd.add(ub)
+        upd.get_style_context().add_class("chip")
+        upd.connect("clicked", lambda *_: (close(), self.check_updates()))
+        upd_row.pack_end(upd, False, False, 0)
+        card.pack_start(upd_row, False, False, 0)
+
+        card.pack_start(label("Account", "hdr"), False, False, 8)
+        out = Gtk.Button(label="Esci dall'account")
+        out.get_style_context().add_class("chip")
+        out.set_halign(Gtk.Align.START)
+        out.connect("clicked", lambda *_: (close(), self.auth.logout()))
+        card.pack_start(out, False, False, 0)
+
+        done = Gtk.Button(label="Fatto")
+        done.get_style_context().add_class("chip")
+        done.get_style_context().add_class("sel")
+        done.connect("clicked", close)
+        card.pack_start(done, False, False, 10)
+        shade.show_all()
+
 
     def navigate_root(self, pg):
         self.stack = [pg]; self.render()
@@ -2137,6 +2475,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
             c.destroy()
         self.track_labels = []
         self.like_buttons = []
+        self.page_cache_keys = []
 
     def render(self):
         self.token += 1
@@ -2154,6 +2493,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def load(self, container, cache_key, fn, build):
         """Mostra uno spinner, carica in background e costruisce il contenuto."""
         token = self.token
+        self.page_cache_keys.append(cache_key)
         hit = self.cache.get(cache_key) if cache_key else None
         if hit and time.time() - hit[0] < CACHE_TTL:
             build(container, hit[1]); container.show_all()
@@ -2189,15 +2529,16 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.bg(fn, done, fail)
 
     def scrolled_list(self, container, force_list=False):
-        return (CardView if self.cards and not force_list else ListView)(container)
+        self.cur_view = (CardView if self.cards and not force_list else ListView)(container)
+        return self.cur_view
 
     def add_header(self, view, text):
         view.header(text)
 
     def add_row(self, view, title, subtitle, image=None, round_img=False, action=None, buttons=(),
-                extra=None, number=None, current=False, uri=None, icon=None):
+                extra=None, number=None, current=False, uri=None, icon=None, hold=None):
         lt = view.item(title, subtitle, image=image, round_img=round_img, action=action, buttons=buttons,
-                       extra=extra, number=number, current=current, icon=icon)
+                       extra=extra, number=number, current=current, icon=icon, hold=hold)
         if uri:
             self.track_labels.append((uri, lt))
 
@@ -2223,20 +2564,64 @@ class DeskPlayer(Gtk.ApplicationWindow):
                          action=(lambda i=i: on_play(i)) if on_play else None, buttons=buttons,
                          extra=fmt(t["duration"]))
 
-    def add_colls(self, view, colls):
+    def add_colls(self, view, colls, foldable=False):
+        """`foldable`: playlist della libreria, che con il tocco prolungato si spostano nelle cartelle."""
         cur = self.player.get("context") if self.player else None
         for c in colls:
             buttons = []
             if c["kind"] != "artist":
                 buttons = [("media-playback-start-symbolic", lambda c=c: self.play_context(c["uri"]), "Riproduci")]
             image = (c["image"], c.get("medium")) if self.cards else c["image"]
-            self.add_row(view, c["name"], c["subtitle"], image=image, round_img=c["kind"] == "artist",
-                         action=lambda c=c: self.open(("detail", c)), buttons=buttons, current=c["uri"] == cur)
+            hold = (lambda c=c: self.playlist_menu(c)) if foldable and c["kind"] == "playlist" else None
+            liked = c["kind"] == "liked"
+            self.add_row(view, c["name"], c["subtitle"], image=None if liked else image,
+                         icon=LIKE_ON if liked else None, round_img=c["kind"] == "artist",
+                         action=(lambda: self.open(("liked",))) if liked else (lambda c=c: self.open(("detail", c))),
+                         buttons=buttons, current=c["uri"] == cur, hold=hold)
+
+    def shortcut_grid(self, colls, now_uri=None):
+        """Scorciatoie in cima a Recenti: riquadri compatti (copertina e nome), 4 per riga."""
+        f = Gtk.FlowBox()
+        f.set_selection_mode(Gtk.SelectionMode.NONE)
+        f.set_homogeneous(True)
+        f.set_min_children_per_line(4)
+        f.set_max_children_per_line(4)
+        f.set_column_spacing(8)
+        f.set_row_spacing(8)
+        f.connect("child-activated", lambda _f, ch: ch.action())
+        for c in colls:
+            ch = Gtk.FlowBoxChild()
+            tile = Gtk.Box(spacing=8)
+            tile.get_style_context().add_class("tile")
+            if c["kind"] == "liked":
+                im = Gtk.Image.new_from_icon_name(LIKE_ON, Gtk.IconSize.DIALOG)
+                im.set_pixel_size(28)
+                im.set_size_request(56, 56)
+            else:
+                im = Gtk.Image()
+                set_image(im, c.get("image") or None, 56)
+            tile.pack_start(im, False, False, 0)
+            lt = Gtk.Label(label=c["name"], xalign=0)
+            lt.get_style_context().add_class("tiletitle")
+            if c["uri"] == now_uri:
+                lt.get_style_context().add_class("cur")
+            lt.set_line_wrap(True)
+            lt.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            lt.set_lines(2)
+            lt.set_ellipsize(Pango.EllipsizeMode.END)
+            lt.set_max_width_chars(1)
+            lt.set_margin_end(6)
+            tile.pack_start(lt, True, True, 0)
+            ch.add(tile)
+            ch.action = (lambda: self.open(("liked",))) if c["kind"] == "liked" else (
+                lambda c=c: self.open(("detail", c)))
+            f.add(ch)
+        return f
 
     def empty(self, view, text):
         view.empty(text)
 
-    def back_header(self, title, subtitle=None, image=None, play=None):
+    def back_header(self, title, subtitle=None, image=None, play=None, tools=()):
         h = Gtk.Box(spacing=10)
         h.set_margin_end(12)
         h.pack_start(icon_button("go-previous-symbolic", self.back, tip="Indietro"), False, False, 0)
@@ -2248,6 +2633,9 @@ class DeskPlayer(Gtk.ApplicationWindow):
         sub = label(subtitle or "", "rsub")
         col.pack_start(sub, False, False, 0)
         h.pack_start(col, True, True, 0)
+        for w in tools:
+            w.set_valign(Gtk.Align.CENTER)
+            h.pack_start(w, False, False, 0)
         if play:
             b = icon_button("media-playback-start-symbolic", play, cls="playbtn", size=26, tip="Riproduci")
             b.set_valign(Gtk.Align.CENTER)
@@ -2269,53 +2657,317 @@ class DeskPlayer(Gtk.ApplicationWindow):
         liked = Gtk.Button(label="Preferiti"); liked.get_style_context().add_class("chip")
         liked.connect("clicked", lambda *_: self.open(("liked",)))
         chips.pack_start(liked, False, False, 0)
+        if self.lib_tab != "recent":
+            self.page_sorts = self.PAGE_SORTS.get(self.lib_tab, self.ALL_SORTS)
+        fb = self.filter_button(playlists=self.lib_tab == "playlist")
+        fb.set_sensitive(self.lib_tab != "recent")  # Recenti: sempre dal più recente
+        chips.pack_start(fb, False, False, 0)
+        for w in chips.get_children():
+            w.set_valign(Gtk.Align.CENTER)  # i chip non si allungano all'altezza del pulsante filtri
         self.content.pack_start(chips, False, False, 0)
         if self.lib_tab == "recent":
             self.recent_tab()
             return
-        self.page_sorts = self.PAGE_SORTS.get(self.lib_tab, self.ALL_SORTS)
-        self.toolbar(icon_button("view-refresh-symbolic", self.reload_library, tip="Aggiorna"))
         fn = {"playlist": self.api.playlists, "album": self.api.albums, "artist": self.api.artists}[self.lib_tab]
 
         def build(container, colls):
             lb = self.scrolled_list(container)
             if not colls:
                 self.empty(lb, "Niente qui")
-            self.add_colls(lb, self.sorted_items(colls))
+            if self.lib_tab == "playlist":
+                self.add_playlists(lb, colls)
+            else:
+                self.add_colls(lb, self.sorted_items(colls))
         self.load(self.content, "lib:" + self.lib_tab, self.with_recent(fn), build)
 
-    def recent_tab(self):
-        """Album e playlist ascoltati di recente (anche non salvati), poi i brani, dal più recente."""
-        bar = Gtk.Box(spacing=8)
-        bar.set_margin_start(16); bar.set_margin_end(8); bar.set_margin_bottom(4)
-        bar.pack_start(label("Dagli ultimi 50 ascolti", "rsub"), False, False, 0)
+    # ---------------- cartelle di playlist ----------------
+    # Le API di Spotify non danno le cartelle della libreria: queste esistono solo nel Desk Player,
+    # in state.json, come [{"name": ..., "ids": [id delle playlist]}].
 
-        def reload():
-            self.api._recent = (0, None)
+    PL_GROUPS = (("mine", "Le tue playlist"), ("followed", "Seguite"), ("spotify", "Di Spotify"))
+    PL_FILTERS = (("all", "Tutte"), ("mine", "Mie"), ("followed", "Seguite"), ("spotify", "Di Spotify"))
+
+    @staticmethod
+    def pl_group(c):
+        return c.get("group", "mine")
+
+    @property
+    def pl_filter(self):
+        f = self.state.get("pl_filter", "all")
+        return f if f in dict(self.PL_FILTERS) else "all"
+
+    def filter_playlists(self, colls):
+        f = self.pl_filter
+        return colls if f == "all" else [c for c in colls if self.pl_group(c) == f]
+
+    @property
+    def folders(self):
+        return self.state.setdefault("folders", [])
+
+    def folder(self, name):
+        return next((f for f in self.folders if f["name"] == name), None)
+
+    def folder_of(self, pid):
+        return next((f for f in self.folders if pid in f["ids"]), None)
+
+    def save_folders(self):
+        self.folders.sort(key=lambda f: f["name"].casefold())
+        save_json(STATE_FILE, self.state)
+        self.render_keep_scroll()
+
+    def render_keep_scroll(self):
+        """Ridisegna la pagina restando allo stesso punto dell'elenco."""
+        v = self.cur_view.sw.get_vadjustment().get_value() if getattr(self, "cur_view", None) else 0
+        self.render()
+
+        def restore():
+            if getattr(self, "cur_view", None):
+                self.cur_view.sw.get_vadjustment().set_value(v)
+            return False
+        GLib.timeout_add(80, restore)
+
+    def add_playlists(self, view, colls):
+        """Prima le cartelle, poi le playlist fuori dalle cartelle: le tue, seguite, di Spotify."""
+        colls = self.filter_playlists(colls)
+        known = {c["id"] for c in colls}
+        cur = self.player.get("context") if self.player else None
+        shown = [f for f in self.folders if self.pl_filter == "all" or any(i in known for i in f["ids"])]
+        if shown:
+            self.add_header(view, "Cartelle")
+        if not colls and not shown:
+            self.empty(view, "Nessuna playlist con questo filtro")
+        for f in shown:
+            ids = [i for i in f["ids"] if i in known]
+            n = len(ids)
+            self.add_row(view, f["name"], f"{n} playlist" if n != 1 else "1 playlist", icon="folder-symbolic",
+                         action=lambda f=f: self.open(("folder", f["name"])),
+                         current=bool(cur) and any(f"spotify:playlist:{i}" == cur for i in ids),
+                         hold=lambda f=f: self.folder_menu(f))
+        loose = [c for c in self.sorted_items(colls) if not self.folder_of(c["id"])]
+        for key, title in self.PL_GROUPS:
+            group = [c for c in loose if self.pl_group(c) == key]
+            if group:
+                self.add_header(view, title)
+                self.add_colls(view, group, foldable=True)
+
+    def page_folder(self, name):
+        f = self.folder(name)
+        if not f:
+            self.stack.pop()
             self.render()
-        bar.pack_end(icon_button("view-refresh-symbolic", reload, tip="Aggiorna"), False, False, 0)
-        self.content.pack_start(bar, False, False, 0)
+            return
+        self.page_sorts = self.PAGE_SORTS["playlist"]
+        sub = self.back_header(name, "", tools=[self.filter_button(playlists=True)])
 
-        def build(container, data):
+        def build(container, colls):
+            inside = [c for c in self.filter_playlists(colls) if c["id"] in f["ids"]]
+            sub.set_text(f"{len(inside)} playlist" if len(inside) != 1 else "1 playlist")
             lb = self.scrolled_list(container)
-            if data["colls"]:
-                self.add_header(lb, "Album e playlist")
-                self.add_colls(lb, [dict(c, subtitle=" · ".join(v for v in (c["subtitle"], played_label(c["played"])) if v))
-                                    for c in data["colls"]])
-            tracks = data["tracks"]
+            if not inside:
+                self.empty(lb, "Cartella vuota. Tocca a lungo una playlist per spostarla qui."
+                           if self.pl_filter == "all" else "Nessuna playlist con questo filtro")
+            self.add_colls(lb, self.sorted_items(inside), foldable=True)
+        self.load(self.content, "lib:playlist", self.with_recent(self.api.playlists), build)
+
+    def modal(self, title, subtitle=None, top=False):
+        """Finestra modale dentro l'app; si chiude toccando fuori. Restituisce (scheda, chiudi, sfondo):
+        chi la crea aggiunge il contenuto alla scheda e poi chiama sfondo.show_all()."""
+        old = getattr(self, "_modal", None)
+        if old:
+            old.destroy()
+        shade = Gtk.EventBox()
+        shade.get_style_context().add_class("shade")
+        card_ev = Gtk.EventBox(halign=Gtk.Align.CENTER, valign=Gtk.Align.START if top else Gtk.Align.CENTER)
+        if top:
+            card_ev.set_margin_top(40)  # sopra la tastiera a schermo
+        card_ev.connect("button-release-event", lambda *_: True)  # i tocchi sulla scheda non la chiudono
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("sortcard")
+        card.set_size_request(380, -1)
+        card_ev.add(card)
+        shade.add(card_ev)
+        pressed = [False]  # si chiude solo per un tocco iniziato sullo sfondo (non per il rilascio
+        shade.connect("button-press-event", lambda *_: pressed.__setitem__(0, True) or False)  # del tocco lungo)
+
+        def close(*_):
+            shade.destroy()
+            if getattr(self, "_modal", None) is shade:
+                self._modal = None
+            return True
+        shade.connect("button-release-event", lambda *a: close() if pressed[0] else True)
+        card.pack_start(label(title, "dtitle"), False, False, 4)
+        if subtitle:
+            card.pack_start(label(subtitle, "rsub"), False, False, 0)
+        self.overlay.add_overlay(shade)
+        self._modal = shade
+        return card, close, shade
+
+    @staticmethod
+    def modal_option(box, text, cb, sel=False, icon=None):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class("sortopt")
+        if sel:
+            btn.get_style_context().add_class("sel")
+        hb = Gtk.Box(spacing=10)
+        if icon:
+            im = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+            im.set_pixel_size(20)
+            hb.pack_start(im, False, False, 0)
+        lb = Gtk.Label(label=text, xalign=0)
+        lb.set_ellipsize(Pango.EllipsizeMode.END)
+        hb.pack_start(lb, True, True, 0)
+        btn.add(hb)
+        btn.connect("clicked", lambda *_: cb())
+        box.pack_start(btn, False, False, 0)
+        return btn
+
+    def playlist_menu(self, c):
+        """Tocco prolungato su una playlist: in quale cartella metterla."""
+        card, close, shade = self.modal(c["name"], "Sposta in cartella")
+        inside = self.folder_of(c["id"])
+
+        def move(f):
+            close()
+            for x in self.folders:
+                if c["id"] in x["ids"]:
+                    x["ids"].remove(c["id"])
+            if f is not None:
+                f["ids"].append(c["id"])
+                self.show_toast(f"Spostata in {f['name']}")
+            else:
+                self.show_toast("Tolta dalla cartella")
+            self.save_folders()
+
+        opts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for f in self.folders:
+            self.modal_option(opts, f["name"], lambda f=f: close() if f is inside else move(f),
+                              sel=f is inside, icon="folder-symbolic")
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_propagate_natural_height(True)
+        sw.set_max_content_height(300)
+        sw.add(opts)
+        if self.folders:
+            card.pack_start(sw, False, False, 0)
+
+        def new_folder():
+            def made(name):
+                f = {"name": name, "ids": []}
+                self.folders.append(f)
+                move(f)
+            self.name_dialog("Nuova cartella", "", made)
+        self.modal_option(card, "Nuova cartella…", new_folder, icon="folder-new-symbolic")
+        if inside:
+            self.modal_option(card, f"Togli da {inside['name']}", lambda: move(None), icon="edit-undo-symbolic")
+        shade.show_all()
+
+    def folder_menu(self, f):
+        """Tocco prolungato su una cartella: rinominarla o eliminarla."""
+        card, close, shade = self.modal(f["name"], "Cartella")
+
+        def rename():
+            def done(name):
+                for i, x in enumerate(self.stack):
+                    if x == ("folder", f["name"]):
+                        self.stack[i] = ("folder", name)
+                f["name"] = name
+                self.save_folders()
+            self.name_dialog("Rinomina cartella", f["name"], done, current=f)
+
+        def delete():
+            close()
+            self.folders.remove(f)
+            self.show_toast(f"Cartella {f['name']} eliminata: le playlist restano nella libreria")
+            self.save_folders()
+        self.modal_option(card, "Rinomina", rename, icon="document-edit-symbolic")
+        self.modal_option(card, "Elimina cartella", delete, icon="user-trash-symbolic")
+        note = label("Le playlist che contiene restano nella libreria", "rsub", ellipsize=False, wrap=True)
+        note.set_max_width_chars(40)
+        card.pack_start(note, False, False, 4)
+        shade.show_all()
+
+    def name_dialog(self, title, initial, on_ok, current=None):
+        """Chiede il nome di una cartella (non vuoto, non già usato da un'altra)."""
+        card, close, shade = self.modal(title, top=True)
+        entry = Gtk.Entry()
+        entry.set_text(initial)
+        entry.set_placeholder_text("Nome della cartella")
+        entry.set_activates_default(False)
+        card.pack_start(entry, False, False, 4)
+        row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Annulla")
+        cancel.get_style_context().add_class("chip")
+        cancel.connect("clicked", close)
+        ok = Gtk.Button(label="Fatto")
+        ok.get_style_context().add_class("chip")
+        ok.get_style_context().add_class("sel")
+        row.pack_start(cancel, False, False, 0)
+        row.pack_start(ok, False, False, 0)
+        card.pack_start(row, False, False, 6)
+
+        def accept(*_):
+            name = " ".join(entry.get_text().split())
+            if not name:
+                self.show_toast("Scrivi un nome")
+                return
+            if any(x is not current and x["name"].casefold() == name.casefold() for x in self.folders):
+                self.show_toast(f"Esiste già una cartella {name}")
+                return
+            close()
+            self.touch_focus.drop(True)
+            on_ok(name)
+        ok.connect("clicked", accept)
+        entry.connect("activate", accept)
+        shade.show_all()
+        entry.grab_focus_without_selecting()  # cursore in fondo: si corregge il nome, non lo si riscrive
+        entry.set_position(-1)
+
+    def recent_tab(self):
+        """Recenti, come la parte alta della home di Spotify: scorciatoie a ciò che ascolti di più in
+        questo periodo, gli ascoltati di recente, i più ascoltati del mese (dallo storico locale), poi
+        i brani (dagli ultimi 50 ascolti di Spotify)."""
+        p = self.player
+        current = (p.get("context"), p["track"]) if p and p["track"] else None  # None: la legge recent_overview
+        now_uri = History.key_of(*current)[0] if current and p["playing"] else None
+
+        def fetch():
+            items = self.api.recent_items(max_age=15)
+            self.history.merge_api(items, self.api.context_meta)
+            tracks = self.api.recent_overview(current, max_colls=0)["tracks"]
+            return {"short": self.history.shortcuts(8), "recent": self.history.recent(30),
+                    "top": self.history.top(8), "tracks": tracks}
+
+        def sub(c, extra):
+            return " · ".join(v for v in (c["subtitle"], extra) if v)
+
+        def build(container, d):
+            lb = self.scrolled_list(container)
+            if d["short"]:
+                lb.widget(self.shortcut_grid(d["short"], now_uri))
+            if d["recent"]:
+                self.add_header(lb, "Ascoltati di recente")
+                self.add_colls(lb, [dict(c, subtitle=sub(c, "in riproduzione" if c["uri"] == now_uri
+                                                         else played_label(c["played"]))) for c in d["recent"]])
+            if d["top"]:
+                self.add_header(lb, "I più ascoltati nell'ultimo mese")
+                self.add_colls(lb, [dict(c, subtitle=sub(c, fmt_long(c["secs"] * 1000))) for c in d["top"]])
+            tracks = d["tracks"]
             if tracks:
                 self.add_header(lb, "Brani")
                 self.add_tracks(lb, tracks, lambda i: self.play_track(tracks[i]))
-            if not data["colls"] and not tracks:
+            if not d["recent"] and not tracks:
                 self.empty(lb, "Nessun ascolto recente")
-        p = self.player
-        current = (p.get("context"), p["track"]) if p and p["track"] else None  # None: la legge recent_overview
-        self.load(self.content, None, self.with_saved(lambda: self.api.recent_overview(current), lambda d: d["tracks"]),
-                  build)
+        self.load(self.content, None, self.with_saved(fetch, lambda d: d["tracks"]), build)
 
-    def reload_library(self):
-        self.cache.pop("lib:" + self.lib_tab, None)
-        self.liked_state = None
+    def refresh_page(self):
+        """Pulsante Aggiorna: ricarica da Spotify la pagina corrente."""
+        for k in self.page_cache_keys:
+            self.cache.pop(k, None)
+        pg = self.stack[-1][0]
+        if pg == "liked":
+            self.liked_state = None
+        if pg == "library" and self.lib_tab == "recent":
+            self.api._recent = (0, None)
         self.render()
 
     def page_search(self):
@@ -2367,9 +3019,6 @@ class DeskPlayer(Gtk.ApplicationWindow):
             if not queue:
                 self.empty(lb, "La coda è vuota")
             self.add_tracks(lb, queue, None, removable=True)
-        h = Gtk.Box(); h.set_margin_start(14)
-        h.pack_end(icon_button("view-refresh-symbolic", self.render, tip="Aggiorna"), False, False, 8)
-        self.content.pack_start(h, False, False, 0)
         self.load(self.content, None, self.with_saved(self.api.queue, lambda d: [d[0]] + d[1]), build)
 
     def check_updates(self):
@@ -2379,30 +3028,13 @@ class DeskPlayer(Gtk.ApplicationWindow):
     def page_devices(self):
         h = Gtk.Box(spacing=8); h.set_margin_start(14); h.set_margin_top(4)
         h.pack_start(label("Dove ascoltare", "hdr"), False, False, 0)
-        out = Gtk.Button(label="Esci dall'account"); out.get_style_context().add_class("chip")
-        out.connect("clicked", lambda *_: self.auth.logout())
-        h.pack_end(out, False, False, 8)
-        h.pack_end(icon_button("view-refresh-symbolic", self.render, tip="Aggiorna"), False, False, 0)
         self.content.pack_start(h, False, False, 0)
         if self.auth.missing_scopes():
-            warn = label("Questa versione ha bisogno di nuovi permessi Spotify: tocca \"Esci dall'account\", "
+            warn = label("Questa versione ha bisogno di nuovi permessi Spotify: apri le impostazioni (⚙), "
+                         "tocca \"Esci dall'account\", "
                          "poi ricollegati dal PC come la prima volta.", "rsub", ellipsize=False, wrap=True)
             warn.set_margin_start(16); warn.set_margin_end(16); warn.set_margin_bottom(4)
             self.content.pack_start(warn, False, False, 0)
-        foot = Gtk.Box(spacing=10)
-        foot.set_margin_start(16); foot.set_margin_end(12); foot.set_margin_bottom(8)
-        foot.pack_start(label(f"Desk Player {obc_update.read_version(APP_DIR)}", "rsub", ellipsize=False), False, False, 0)
-        upd = Gtk.Button()
-        ub = Gtk.Box(spacing=6)
-        ui = Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
-        ui.set_pixel_size(16)
-        ub.pack_start(Gtk.Label(label="Controlla aggiornamenti"), False, False, 0)
-        ub.pack_start(ui, False, False, 0)
-        upd.add(ub)
-        upd.get_style_context().add_class("chip")
-        upd.connect("clicked", lambda *_: self.check_updates())
-        foot.pack_end(upd, False, False, 0)
-        self.content.pack_end(foot, False, False, 0)
         icons = {"computer": "computer-symbolic", "smartphone": "phone-symbolic", "tablet": "phone-symbolic",
                  "tv": "video-display-symbolic", "castvideo": "video-display-symbolic"}
 
@@ -2417,8 +3049,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.load(self.content, None, self.api.devices, build)
 
     def page_liked(self):
-        self.back_header("Brani che ti piacciono")
-        self.toolbar()
+        self.back_header("Brani che ti piacciono", tools=[self.filter_button()])
         if self.liked_state is None:
             self.liked_state = {"items": [], "total": None, "loading": False}
         st = self.liked_state
@@ -2486,12 +3117,12 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.load(holder, None, first, built)
 
     def page_detail(self, c):
-        sub = self.back_header(c["name"], c["subtitle"], c["image"] or "", play=lambda: self.play_context(c["uri"]))
+        tools = [self.filter_button()] if c["kind"] == "playlist" else []
+        sub = self.back_header(c["name"], c["subtitle"], c["image"] or "", play=lambda: self.play_context(c["uri"]),
+                               tools=tools)
         if c["kind"] == "artist":
             self.artist_page(c)
             return
-        if c["kind"] == "playlist":
-            self.toolbar()
         if c["kind"] == "playlist":
             fn = lambda: self.api.playlist_tracks(c["id"])  # noqa: E731
         else:
@@ -2524,7 +3155,9 @@ class DeskPlayer(Gtk.ApplicationWindow):
             b.connect("clicked", lambda _b, k=key: (setattr(self, "artist_filter", k), self.render()))
             chips.pack_start(b, False, False, 0)
         self.page_sorts = self.PAGE_SORTS["releases"]
-        chips.pack_end(self.sort_button(), False, False, 8)
+        chips.pack_start(self.filter_button(), False, False, 0)
+        for w in chips.get_children():
+            w.set_valign(Gtk.Align.CENTER)
         self.content.pack_start(chips, False, False, 0)
         header_image = self.header_image
 
@@ -2575,7 +3208,8 @@ class App(Gtk.Application):
         elif name == "liked-more":
             getattr(self.win, "_liked_more", lambda: None)()
         elif name == "sort-dialog":
-            self.win.sort_dialog()
+            self.win.sort_dialog(self.win.stack[-1][0] == "folder" or (
+                self.win.stack[-1][0] == "library" and self.win.lib_tab == "playlist"))
         elif name == "current-artist":
             self.win.open_current_artist()
         elif name.startswith("accent:"):
@@ -2612,6 +3246,11 @@ class App(Gtk.Application):
         else:
             self.win.show_main()
             self.win.navigate_root((name,))
+
+    def do_shutdown(self):
+        if self.win:
+            self.win.history.flush()  # lo storico si salva al massimo ogni minuto: alla chiusura, subito
+        Gtk.Application.do_shutdown(self)
 
     def do_activate(self):
         if self.win is None:
