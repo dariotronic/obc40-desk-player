@@ -105,7 +105,8 @@ These come from the Spotify Web API or the platform. They are not bugs to fix.
 | Playing a list of `uris` returns 204 but nothing plays, at least on the desktop client | Every track starts inside a **context** with an offset: its album, or your Liked Songs collection |
 | Tracks of playlists owned by **other users** return 403, even if you follow them: the API only serves playlists you own or collaborate on | Search only shows your own playlists. Opening someone else's playlist shows a message; ▶ still tries to play it |
 | The API cannot remove tracks from the queue | A removed track is hidden and skipped when it starts, as long as the app is running |
-| Spotify limits how many requests an app can make (HTTP 429) | Desk Player waits as long as Spotify asks (`Retry-After`), checks the player less often when nothing plays, and not at all while minimised |
+| Spotify limits how many requests an app can make (HTTP 429). An app in development mode that keeps going over the limit can be blocked for many hours | Desk Player waits as long as Spotify asks (`Retry-After`), checks the player less often when nothing plays, and not at all while minimised. It also stops by itself for a minute if it ever makes more than 120 requests in a minute |
+| Apps registered since late 2024 get 404 for playlists made by Spotify (Daily Mix, Discover Weekly, Radio…) | Those playlists have no name or cover in Recenti. Desk Player asks for each one at most once every 6 hours |
 | "Recently played" only covers the last 50 plays | Desk Player keeps its own listening history for Recenti. The "Ascoltato" sort still uses the last 50 plays; items without data go to the bottom |
 | Spotify adds a track to "recently played" only after about 30 seconds of listening | Recenti shows what is playing now on top |
 | Followed playlists and artists have no dates | Those pages offer no date-based sorting |
