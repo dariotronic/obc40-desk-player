@@ -2,6 +2,14 @@
 
 All notable changes to obc40-desk-player. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.1.1
+
+- Fixed: 0.1.0 could make far too many requests to Spotify, and Spotify could then block the app for many hours.
+  - Cause: while a playlist made by Spotify was playing (Daily Mix, Discover Weekly, Radio…), Desk Player asked for its name every 2 seconds. Apps registered since late 2024 always get an error for those playlists.
+  - Now a playlist, album or artist that Spotify does not return is asked for at most once every 6 hours, and at most 10 new ones are looked up per minute.
+  - When the ♥ state of a track cannot be read, Desk Player waits 5 minutes before trying again.
+  - Safety limit: if Desk Player ever makes more than 120 requests in a minute, it stops for the rest of that minute and says so.
+
 ## 0.1.0
 
 - **Recenti** is laid out like the top of the Spotify home: eight shortcuts to what you play most these days, then **Ascoltati di recente**, **I più ascoltati nell'ultimo mese** and the tracks. It now includes artists and Liked Songs, and is no longer limited to the last 50 plays.

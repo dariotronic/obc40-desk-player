@@ -8,6 +8,7 @@ One-time login from a PC (the board's sshd does not allow `ssh -L`):
 then open http://127.0.0.1:8888 in the PC browser.
 """
 import base64
+import collections
 import datetime
 import hashlib
 import html
@@ -302,6 +303,9 @@ def parse_device(j):
 
 class Spotify:
     MAX_BACKOFF = 60
+    CALLS_PER_MIN = 120       # tetto di sicurezza su tutte le richieste: oltre, ci si ferma da soli
+    META_PER_MIN = 10         # richieste al minuto per nome e copertina dei contesti dello storico
+    CTX_FAIL_TTL = 6 * 3600   # un contesto illeggibile (es. 404) non si richiede per 6 ore
 
     def __init__(self, auth):
         self.auth = auth
@@ -311,10 +315,34 @@ class Spotify:
         self._recent = (0, None)
         self.recent_by_uri = {}  # ultima mappa calcolata da recent_map(), letta dall'ordinamento
         self._ctx_cache = {}     # URI di album/playlist -> (istante, scheda), per i contesti degli ascolti
+        self._ctx_fail = {}      # URI -> istante dell'ultimo errore: non si richiede prima di CTX_FAIL_TTL
+        self._calls = collections.deque()  # istanti delle richieste dell'ultimo minuto
+        self._metas = collections.deque()  # istanti delle richieste di metadati dell'ultimo minuto
 
     def rate_limited(self):
         """Secondi che mancano alla fine del blocco per rate limit (0 se non c'è)."""
         return max(0, self.blocked_until - time.time())
+
+    @staticmethod
+    def _slot(times, limit, now):
+        """Registra una richiesta se nell'ultimo minuto ce ne sono state meno di `limit`."""
+        while times and now - times[0] >= 60:
+            times.popleft()
+        if len(times) >= limit:
+            return False
+        times.append(now)
+        return True
+
+    def _local_limit(self):
+        """Tetto di sicurezza: se in un minuto partono troppe richieste (un ciclo per errore),
+        ci si ferma come per un 429, prima che sia Spotify a bloccare l'app per ore."""
+        with self.rl_lock:
+            now = time.time()
+            if self._slot(self._calls, self.CALLS_PER_MIN, now):
+                return
+            self.blocked_until = max(self.blocked_until, self._calls[0] + 60)
+            wait = self.blocked_until - now
+        raise ApiError(429, None, f"Troppe richieste in un minuto: riprovo tra {math.ceil(wait)} s")
 
     def _throttle(self, retry_after):
         """Su un 429: rispetta Retry-After, altrimenti backoff esponenziale con jitter."""
@@ -345,6 +373,7 @@ class Spotify:
         wait = self.rate_limited()
         if wait:
             raise ApiError(429, None, f"Spotify chiede di rallentare: riprovo tra {math.ceil(wait)} s")
+        self._local_limit()
         for attempt in range(2):
             token = self.auth.token(force=attempt > 0)
             data = json.dumps(body).encode() if body is not None else (b"" if method != "GET" else None)
@@ -538,9 +567,17 @@ class Spotify:
                 al = (x.get("track") or {}).get("album") or {}
                 if al.get("uri") == uri:
                     return parse_coll(al, "album")
+        now = time.time()
         hit = self._ctx_cache.get(uri)
-        if hit and time.time() - hit[0] < CACHE_TTL:
+        if hit and now - hit[0] < CACHE_TTL:
             return dict(hit[1])
+        # un contesto che Spotify non dà (playlist create da Spotify come Daily Mix o Radio, che le app
+        # nuove ricevono come 404; playlist cancellate o private) non si richiede a ogni lettura
+        if now - self._ctx_fail.get(uri, 0) < self.CTX_FAIL_TTL:
+            return None
+        with self.rl_lock:
+            if not self._slot(self._metas, self.META_PER_MIN, now):
+                return None  # troppi contesti nuovi in un minuto: gli altri al prossimo aggiornamento
         cid = uri.rsplit(":", 1)[-1]
         try:
             if kind == "album":
@@ -553,11 +590,14 @@ class Spotify:
         except ApiError as e:
             if e.status == 429:
                 raise
+            self._ctx_fail[uri] = time.time()
             return None  # playlist cancellata o non più accessibile: si salta
         c = parse_coll(j, kind)
-        if c:
-            self._ctx_cache[uri] = (time.time(), c)
-        return dict(c) if c else None
+        if not c:
+            self._ctx_fail[uri] = time.time()
+            return None
+        self._ctx_cache[uri] = (time.time(), c)
+        return dict(c)
 
     def context_meta(self, kind, uri):
         """Nome e copertina di un contesto per lo storico."""
@@ -1707,6 +1747,7 @@ class DeskPlayer(Gtk.ApplicationWindow):
         self.artist_filter = "all"
         self.player = None
         self.saved = {}          # URI del brano -> nei Preferiti? (solo in memoria, per la sessione)
+        self.like_fail = {}      # URI del brano -> istante dell'ultima lettura del ♥ fallita
         self.like_buttons = []   # (URI, pulsante) dei cuori nella pagina corrente
         self.scope_warned = False
         self.hold_until = 0
@@ -1942,12 +1983,15 @@ class DeskPlayer(Gtk.ApplicationWindow):
             uri = p["track"]["uri"] if p and p["track"] else None
             liked = None
             # lo stato del cuore si rilegge a ogni cambio di brano (può cambiare da un altro dispositivo)
+            # se la lettura fallisce si riprova solo dopo 5 minuti, non a ogni lettura del player
             if uri and uri.startswith("spotify:track:") and self.can_like() and (
-                    uri != known_uri or uri not in self.saved):
+                    uri != known_uri or uri not in self.saved) and time.time() - self.like_fail.get(uri, 0) > 300:
                 try:
                     liked = self.api.in_library([uri]).get(uri)
                 except ApiError:
                     pass
+                if liked is None:
+                    self.like_fail[uri] = time.time()
             meta = None
             if p and p["playing"] and p["track"]:
                 key, kind = History.key_of(p.get("context"), p["track"])
