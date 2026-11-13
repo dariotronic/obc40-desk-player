@@ -2,6 +2,26 @@
 
 All notable changes to obc40-desk-player. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.1.0
+
+- **Recenti** is laid out like the top of the Spotify home: eight shortcuts to what you play most these days, then **Ascoltati di recente**, **I più ascoltati nell'ultimo mese** and the tracks. It now includes artists and Liked Songs, and is no longer limited to the last 50 plays.
+- Listening history: Desk Player keeps its own history on the board, in `~/.config/desk-player/history.json`. It records what played and for how long, from the player and from Spotify's last 50 plays, and never leaves the board.
+- **Playlist folders**:
+  - touch and hold a playlist to move it into a folder or to create a new one;
+  - touch and hold a folder to rename or delete it; deleting a folder leaves its playlists in the library;
+  - the folders are kept on the board, because the Spotify Web API does not expose the folders of your Spotify library.
+- The Playlist tab shows the folders first, then the other playlists grouped into **Le tue playlist**, **Seguite** and **Di Spotify**.
+- **Sort and filter**: sorting is now in one window, opened by the filter button (three lines) next to Preferiti and at the top of playlist, Liked Songs and artist pages.
+  - For playlists, the same window also shows **Tutte**, **Mie**, **Seguite** or **Di Spotify**, and explains how folders work.
+  - The button turns the accent colour while a filter is active.
+- **Settings**: the new ⚙ button in the top bar replaces the list/card switch. It holds:
+  - the list or card view;
+  - the installed version;
+  - **Controlla aggiornamenti** and **Esci dall'account**, which both moved there from Dispositivi.
+- **Refresh**: one ⟳ button in the top bar reloads any page. The separate refresh buttons in Recenti, Coda and Dispositivi are gone.
+- The 🏠 icon in the top bar is now the same size as ⟳ and ⚙.
+- Fixed: the on-screen keyboard sometimes did not appear when tapping the search bar or a text field. Desk Player now opens and closes onboard itself, instead of relying only on onboard's auto-show, which can stop working until onboard is restarted.
+
 ## 0.0.5
 
 - Fixed: the ♥ next to the current track now shows; in 0.0.4 it stayed hidden.

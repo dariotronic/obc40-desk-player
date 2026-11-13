@@ -12,14 +12,17 @@ The board has no audio output: the music plays on another Spotify device (PC, ph
 
 - **Now playing**: cover, title, artist (tap the artist to open their page), seek bar, play/pause, previous/next, shuffle, repeat, volume and current device. A ⛶ button opens a fullscreen view.
 - **Liked Songs**: a ♥ next to the current track and on every track in lists adds it to, or removes it from, your Liked Songs.
-- **Library**: opens on **Recenti** (recently played): what is playing now on top, then the albums and playlists you played, even if they are not saved, with the time of the last play, then the tracks. Then saved albums, followed artists, playlists and liked songs (loaded 100 at a time, then 50 more each time you reach the bottom).
+- **Library**: opens on **Recenti**, laid out like the top of the Spotify home: eight shortcuts to what you play most these days, then **Ascoltati di recente** (albums, playlists, artists and Liked Songs you played, even if they are not saved, with the time of the last play), **I più ascoltati nell'ultimo mese** (by listening time) and the tracks. It comes from a listening history Desk Player keeps on the board (see [Listening history](#listening-history)). Then saved albums, followed artists, playlists and liked songs (loaded 100 at a time, then 50 more each time you reach the bottom).
+- **Playlist folders**: touch and hold a playlist to move it into a folder, or to create a new one. Touch and hold a folder to rename or delete it. Folders are kept on the board only: the Spotify Web API does not expose the folders of your Spotify library. Playlists outside folders are grouped into your own, followed and made by Spotify.
 - **Search** for tracks, artists, albums and your own playlists.
 - **Queue**, with add (+) and remove (−).
 - **Devices**: move playback to another device.
 - **Artist pages**: releases with Album / Singles / EP filters.
 - **Album and playlist pages**: year, track count and total length.
-- **Sorting**: date added, release date, recently played or name, ascending or descending. Each page only offers the options that make sense for it.
-- **List or card view**. Albums, playlists and the queue always use the list.
+- **Sort and filter**: the filter button (next to Preferiti, or at the top of a page) opens one window with the sort order (date added, release date, recently played or name, ascending or descending; each page only offers the options that make sense for it) and, for playlists, which ones to show: all, yours, followed or made by Spotify. The button turns the accent colour while a filter hides something.
+- **Refresh**: the ⟳ button at the top reloads the current page from Spotify.
+- **List or card view**, chosen in the ⚙ settings. Albums, playlists and the queue always use the list.
+- **Settings** (⚙ in the top bar): list or card view, the installed version, the update check and sign-out.
 - **Accent colour** taken from the album cover, always readable on the dark background.
 - **Covers** are shown whole, with slightly rounded corners and nothing on top of them. In card view a sharp 300 px image replaces the small preview as soon as it loads.
 - Built for touch: no tooltips, no dashed focus rings, works with the onboard on-screen keyboard.
@@ -80,11 +83,11 @@ Then open **Musica** from the menu or the desktop.
 3. Open <http://127.0.0.1:8888> in the PC browser, paste the Client ID, sign in and authorise the app. The display switches to the player by itself.
 4. Close the tunnel with Ctrl+C.
 
-The token renews automatically. It is stored in `~/.config/desk-player/auth.json` (mode 600). To sign out, use **Dispositivi → Esci dall'account**.
+The token renews automatically. It is stored in `~/.config/desk-player/auth.json` (mode 600). To sign out, open the ⚙ settings and tap **Esci dall'account**.
 
 ## Updating
 
-Go to **Dispositivi** (Devices) and tap **Controlla aggiornamenti** ("Check for updates"). If a newer release exists you see what changed and can tap **Aggiorna** ("Update"). The app then:
+Open the ⚙ settings and tap **Controlla aggiornamenti** ("Check for updates"). If a newer release exists you see what changed and can tap **Aggiorna** ("Update"). The app then:
 
 1. downloads the release package;
 2. verifies its SHA-256 checksum;
@@ -103,10 +106,21 @@ These come from the Spotify Web API or the platform. They are not bugs to fix.
 | Tracks of playlists owned by **other users** return 403, even if you follow them: the API only serves playlists you own or collaborate on | Search only shows your own playlists. Opening someone else's playlist shows a message; ▶ still tries to play it |
 | The API cannot remove tracks from the queue | A removed track is hidden and skipped when it starts, as long as the app is running |
 | Spotify limits how many requests an app can make (HTTP 429) | Desk Player waits as long as Spotify asks (`Retry-After`), checks the player less often when nothing plays, and not at all while minimised |
-| "Recently played" only covers the last 50 plays | Items without data go to the bottom |
+| "Recently played" only covers the last 50 plays | Desk Player keeps its own listening history for Recenti. The "Ascoltato" sort still uses the last 50 plays; items without data go to the bottom |
 | Spotify adds a track to "recently played" only after about 30 seconds of listening | Recenti shows what is playing now on top |
 | Followed playlists and artists have no dates | Those pages offer no date-based sorting |
+| The API does not expose the folders of your Spotify library: `GET /me/playlists` returns a flat list | Desk Player has its own folders, saved in `~/.config/desk-player/state.json` on the board |
 | On the 4.14 kernel, recent musl and GLib use `faccessat2` (kernel 5.8 or newer), so GLib file checks always fail | The wrapper preloads [`faccessat-fix`](faccessat-fix/) |
+
+## Listening history
+
+Spotify only returns your last 50 plays, so Desk Player keeps its own history in `~/.config/desk-player/history.json` (mode 600). It never leaves the board. For every album, playlist, artist or Liked Songs that music played from, it stores the name, the cover, the time of the last play, the last 40 plays and the listening time of the last 30 days. A track counts as a play after 30 seconds, as on Spotify.
+
+- While Desk Player is open, it records what plays from the player readings it already makes every few seconds.
+- Every time Recenti loads, it adds Spotify's last 50 plays, so it also catches what you played while Desk Player was closed or minimised. Plays already recorded are not counted twice.
+- It keeps at most 500 items. Delete the file to start over.
+
+The shortcuts rank items by plays, each weighted by how recent it is: a play from a week ago counts half as much as one from today.
 
 ## Uninstall
 
@@ -132,7 +146,7 @@ The code is plain Python 3 + GTK 3 with no build step.
 The `dev/` helpers:
 - `env.sh` attaches an SSH shell to the graphical session.
 - `dpnav.sh <section>` opens a section through D-Bus and takes a screenshot; `dpcall.sh <action>` does the same without the screenshot.
-- `uitool.py tap X Y` simulates taps.
+- `uitool.py tap X Y` simulates taps; `uitool.py hold X Y` simulates a touch and hold.
 
 The D-Bus actions are:
 - the sections `library`, `search`, `queue`, `devices`, `liked`, `recent`;
@@ -203,11 +217,12 @@ Lo script controlla i pacchetti di sistema e, se ne manca qualcuno, si offre di 
    ```
 3. Apri <http://127.0.0.1:8888> nel browser del PC e incolla il Client ID.
 
-**Aggiornamenti**: **Dispositivi → Controlla aggiornamenti**. Se c'è una versione nuova vedi le novità e puoi toccare **Aggiorna**. L'app scarica il pacchetto, ne verifica il checksum, lo installa e si riavvia. Se la nuova versione non parte, torna da sola a quella precedente. Gli aggiornamenti partono solo quando tocchi il pulsante.
+**Aggiornamenti**: ⚙ **Impostazioni → Controlla aggiornamenti**. Nelle impostazioni ci sono anche la vista elenco/schede ed **Esci dall'account**. Se c'è una versione nuova vedi le novità e puoi toccare **Aggiorna**. L'app scarica il pacchetto, ne verifica il checksum, lo installa e si riavvia. Se la nuova versione non parte, torna da sola a quella precedente. Gli aggiornamenti partono solo quando tocchi il pulsante.
 
 **Limiti noti**: sono dell'API di Spotify, vedi la tabella [Known limits](#known-limits).
 - Le playlist di altri utenti non mostrano i brani.
+- Le cartelle di playlist di Spotify non sono disponibili: Desk Player ha le sue, salvate sulla scheda. Tocca a lungo una playlist per spostarla in una cartella.
 - I brani rimossi dalla coda vengono saltati.
-- "Ascoltato" considera solo gli ultimi 50 ascolti.
+- "Ascoltato" considera solo gli ultimi 50 ascolti. La scheda Recenti invece usa uno storico che Desk Player tiene sulla scheda (`~/.config/desk-player/history.json`) e che cresce con il tempo.
 
 **Per chi sviluppa**: vedi [Development](#development) e [Releasing](#releasing-maintainers). Le release le pubblicano solo i maintainer.
